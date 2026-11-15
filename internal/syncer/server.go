@@ -6,8 +6,10 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -38,6 +40,14 @@ type SyncEvent struct {
 	Timestamp  int64         `json:"timestamp"`
 }
 
+// subscriber is one connected SSE client. rescan is a dedicated one-slot
+// signal so a full event buffer can still trigger a catch-up reconciliation.
+type subscriber struct {
+	events chan SyncEvent
+	rescan chan struct{}
+	label  string
+}
+
 // Server exposes a local folder over HTTP + SSE so Cloudflared can tunnel it.
 type Server struct {
 	engine   *Engine
@@ -45,14 +55,14 @@ type Server struct {
 	httpSrv  *http.Server
 
 	subsMu sync.Mutex
-	subs   map[chan SyncEvent]string // subscriber channel -> remote peer label
+	subs   map[chan SyncEvent]*subscriber
 }
 
 // NewServer constructs a sync HTTP server attached to the Engine.
 func NewServer(engine *Engine) *Server {
 	return &Server{
 		engine: engine,
-		subs:   make(map[chan SyncEvent]string),
+		subs:   make(map[chan SyncEvent]*subscriber),
 	}
 }
 
@@ -77,8 +87,13 @@ func (s *Server) Start(port int) (int, error) {
 		listeners = append(listeners, ln6)
 	}
 
-	tlsCfg, _, _ := EnsureLocalTLSConfig()
-	dualLn := newDualProtocolListener(listeners, tlsCfg)
+	tlsCfg, _, tlsErr := EnsureLocalTLSConfig()
+	if tlsErr != nil {
+		s.engine.LogThrottled("tls-init:"+tlsErr.Error(), "WARN", fmt.Sprintf("本地 TLS 证书初始化失败，将以 HTTP 回环提供服务: %v", tlsErr), time.Minute)
+	}
+	dualLn := newDualProtocolListener(listeners, tlsCfg, func(err error) {
+		s.engine.LogThrottled("accept:"+err.Error(), "ERROR", fmt.Sprintf("本地同步监听器异常: %v", err), 30*time.Second)
+	})
 	s.listener = dualLn
 
 	mux := http.NewServeMux()
@@ -90,10 +105,14 @@ func (s *Server) Start(port int) (int, error) {
 	s.httpSrv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
-		_ = s.httpSrv.Serve(dualLn)
+		if err := s.httpSrv.Serve(dualLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			s.engine.LogThrottled("serve:"+err.Error(), "ERROR", fmt.Sprintf("本地同步服务异常退出: %v", err), 30*time.Second)
+		}
 	}()
 
 	return actualPort, nil
@@ -102,8 +121,8 @@ func (s *Server) Start(port int) (int, error) {
 // Stop closes all active SSE streams and shuts down the HTTP listener.
 func (s *Server) Stop() {
 	s.subsMu.Lock()
-	for ch := range s.subs {
-		close(ch)
+	for ch, sub := range s.subs {
+		close(sub.events)
 		delete(s.subs, ch)
 	}
 	s.subsMu.Unlock()
@@ -123,18 +142,23 @@ func (s *Server) ConnectedPeers() int {
 	return len(s.subs)
 }
 
-// Broadcast sends a SyncEvent to all connected SSE clients.
+// Broadcast sends a SyncEvent to all connected SSE clients. If a subscriber's
+// bounded event buffer is full, it raises a rescan signal instead of blocking
+// the watcher; the client then reconciles and catches up on every missed change.
 func (s *Server) Broadcast(ev SyncEvent) {
 	if ev.Timestamp == 0 {
 		ev.Timestamp = time.Now().UTC().UnixMilli()
 	}
 	s.subsMu.Lock()
 	defer s.subsMu.Unlock()
-	for ch := range s.subs {
+	for _, sub := range s.subs {
 		select {
-		case ch <- ev:
+		case sub.events <- ev:
 		default:
-			// Drop if client buffer is full; client will rescan
+			select {
+			case sub.rescan <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
@@ -157,15 +181,11 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	snap := s.engine.index.Snapshot()
-	var totalBytes int64
-	for _, f := range snap.Files {
-		totalBytes += f.Size
-	}
+	fileCount, totalBytes := s.engine.index.Counts()
 	resp := map[string]any{
-		"node_id":     snap.NodeID,
+		"node_id":     s.engine.index.NodeID(),
 		"version":     "1.0.0",
-		"file_count":  len(snap.Files),
+		"file_count":  fileCount,
 		"total_bytes": totalBytes,
 		"peers":       s.ConnectedPeers(),
 		"timestamp":   time.Now().UTC().UnixMilli(),
@@ -227,6 +247,9 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveFileDownload(w http.ResponseWriter, _ *http.Request, relPath, fullPath string) {
 	f, err := os.Open(fullPath)
 	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			s.engine.LogThrottled("dl-open:"+relPath+":"+err.Error(), "WARN", fmt.Sprintf("打开待下载文件失败 (%s): %v", relPath, err), 30*time.Second)
+		}
 		http.Error(w, "file not found", http.StatusNotFound)
 		return
 	}
@@ -238,10 +261,12 @@ func (s *Server) serveFileDownload(w http.ResponseWriter, _ *http.Request, relPa
 		return
 	}
 
-	snap := s.engine.index.Snapshot()
-	meta, hasMeta := snap.Files[relPath]
-	if !hasMeta {
-		hash, _ := HashFile(fullPath)
+	meta, hasMeta := s.engine.index.FileMeta(relPath)
+	if !hasMeta || meta.SHA256 == "" {
+		hash, hashErr := HashFile(fullPath)
+		if hashErr != nil {
+			s.engine.LogThrottled("dl-hash:"+relPath+":"+hashErr.Error(), "WARN", fmt.Sprintf("计算文件哈希失败 (%s): %v", relPath, hashErr), 30*time.Second)
+		}
 		fid, _ := SplitFolderRelPath(relPath)
 		meta = FileMeta{
 			FolderID: fid,
@@ -258,8 +283,15 @@ func (s *Server) serveFileDownload(w http.ResponseWriter, _ *http.Request, relPa
 	w.Header().Set("X-SyncT-SHA256", meta.SHA256)
 
 	start := time.Now()
-	n, err := io.Copy(w, f)
-	if err == nil && n > 0 {
+	buf := ioBufferPool.Get().(*[]byte)
+	n, err := io.CopyBuffer(w, f, *buf)
+	ioBufferPool.Put(buf)
+	if err != nil {
+		// Client went away mid-transfer or the disk stalled; nothing to retry here.
+		s.engine.LogThrottled("dl-copy:"+relPath, "WARN", fmt.Sprintf("发送文件中断 (%s): %v", relPath, err), 30*time.Second)
+		return
+	}
+	if n > 0 {
 		s.engine.recordUpload(relPath, n, time.Since(start))
 	}
 }
@@ -276,8 +308,12 @@ func (s *Server) serveFileUpload(w http.ResponseWriter, r *http.Request, cfg con
 	baseHash := strings.TrimSpace(r.URL.Query().Get("base_hash"))
 	originNode := strings.TrimSpace(r.Header.Get("X-SyncT-Node"))
 
+	s.engine.index.BeginWrite(relPath)
+	defer s.engine.index.EndWrite(relPath)
+
 	parentDir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+		s.engine.LogThrottled("up-mkdir:"+relPath+":"+err.Error(), "WARN", fmt.Sprintf("创建上传目标目录失败 (%s): %v", relPath, err), 30*time.Second)
 		http.Error(w, "failed to create parent directory: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -289,15 +325,19 @@ func (s *Server) serveFileUpload(w http.ResponseWriter, r *http.Request, cfg con
 
 	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
+		s.engine.LogThrottled("up-tmp:"+relPath+":"+err.Error(), "WARN", fmt.Sprintf("创建上传临时文件失败 (%s): %v", relPath, err), 30*time.Second)
 		http.Error(w, "failed to create temp file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	hasher := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher), r.Body)
+	buf := ioBufferPool.Get().(*[]byte)
+	written, copyErr := io.CopyBuffer(io.MultiWriter(tmpFile, hasher), r.Body, *buf)
+	ioBufferPool.Put(buf)
 	closeErr := tmpFile.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(tmpPath)
+		s.engine.LogThrottled("up-write:"+relPath+":"+fmt.Sprint(copyErr, closeErr), "WARN", fmt.Sprintf("写入上传文件失败 (%s): %v", relPath, errors.Join(copyErr, closeErr)), 30*time.Second)
 		http.Error(w, "failed to write uploaded file", http.StatusInternalServerError)
 		return
 	}
@@ -312,24 +352,27 @@ func (s *Server) serveFileUpload(w http.ResponseWriter, r *http.Request, cfg con
 	// Check for conflict if existing file differs from both actualHash and baseHash
 	conflictSaved := false
 	if existingInfo, statErr := os.Stat(fullPath); statErr == nil && existingInfo.Mode().IsRegular() {
-		existingHash, _ := HashFile(fullPath)
-		if existingHash != "" && existingHash != actualHash {
+		existingHash, hashErr := HashFile(fullPath)
+		if hashErr == nil && existingHash != "" && existingHash != actualHash {
 			if cfg.ConflictPolicy == config.ConflictKeepBoth && baseHash != "" && baseHash != existingHash {
 				backupPath := ConflictBackupPath(fullPath)
 				if err := copyFileContents(fullPath, backupPath); err == nil {
 					conflictSaved = true
 					s.engine.incrementConflict()
 					s.engine.Logf("冲突保护: 已保存本地冲突副本 %s", filepath.Base(backupPath))
+				} else {
+					s.engine.LogThrottled("up-conflict:"+relPath+":"+err.Error(), "WARN", fmt.Sprintf("保存上传冲突副本失败 (%s): %v", filepath.Base(backupPath), err), 30*time.Second)
 				}
 			}
 		}
 	}
 
 	modTime := time.UnixMilli(mtimeMs)
-	_ = os.Chtimes(tmpPath, modTime, modTime)
+	if err := os.Chtimes(tmpPath, modTime, modTime); err != nil {
+		s.engine.LogThrottled("up-chtimes:"+relPath, "WARN", fmt.Sprintf("设置上传文件时间失败 (%s): %v", relPath, err), time.Minute)
+	}
 
 	fid, _ := SplitFolderRelPath(relPath)
-	// Record in index BEFORE rename so local file watcher sees it as already synced
 	meta := FileMeta{
 		FolderID: fid,
 		RelPath:  relPath,
@@ -341,24 +384,26 @@ func (s *Server) serveFileUpload(w http.ResponseWriter, r *http.Request, cfg con
 	if conflictSaved {
 		st = StatusConflict
 	}
-	s.engine.index.MarkFileSynced(meta, st, "远端 -> 本地")
 
-	if err := os.Rename(tmpPath, fullPath); err != nil {
-		_ = os.Remove(fullPath)
-		if err2 := os.Rename(tmpPath, fullPath); err2 != nil {
-			_ = os.Remove(tmpPath)
-			http.Error(w, "failed to commit file: "+err2.Error(), http.StatusInternalServerError)
-			return
-		}
+	// Commit first, index second: a failed rename leaves the index describing
+	// the file that is actually on disk, instead of advertising content that
+	// was never committed.
+	if err := replaceFile(tmpPath, fullPath); err != nil {
+		_ = os.Remove(tmpPath)
+		s.engine.LogThrottled("up-commit:"+relPath+":"+err.Error(), "WARN", fmt.Sprintf("提交上传文件失败 (%s): %v", relPath, err), 30*time.Second)
+		http.Error(w, "failed to commit file: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
-	_ = os.Chtimes(fullPath, modTime, modTime)
+	if err := os.Chtimes(fullPath, modTime, modTime); err != nil {
+		s.engine.LogThrottled("up-chtimes:"+relPath, "WARN", fmt.Sprintf("设置上传文件时间失败 (%s): %v", relPath, err), time.Minute)
+	}
 
-	// Refresh exact mtime from filesystem in case OS rounded it
+	// Refresh exact mtime from filesystem in case the OS rounded it.
 	if info, err := os.Stat(fullPath); err == nil {
 		meta.ModTime = info.ModTime().UTC().UnixMilli()
-		s.engine.index.MarkFileSynced(meta, st, "远端 -> 本地")
 	}
-	s.engine.index.Save()
+	s.engine.index.MarkFileSynced(meta, st, "远端 -> 本地")
+	s.engine.index.RequestSave()
 
 	s.engine.recordDownload(relPath, written, time.Since(start))
 	s.engine.markSyncedActivity(fmt.Sprintf("接收文件更新: %s (%s)", relPath, FormatBytes(written)))
@@ -382,10 +427,16 @@ func (s *Server) serveFileDelete(w http.ResponseWriter, r *http.Request, cfg con
 	deletedAt, _ := strconv.ParseInt(r.URL.Query().Get("deleted_at"), 10, 64)
 	originNode := strings.TrimSpace(r.Header.Get("X-SyncT-Node"))
 
+	if err := os.Remove(fullPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		// Do not record a tombstone for a file that is still present; the peer
+		// will retry on its next reconciliation instead of flapping.
+		s.engine.LogThrottled("del-fail:"+relPath+":"+err.Error(), "WARN", fmt.Sprintf("删除本地文件失败 (%s): %v", relPath, err), 30*time.Second)
+		http.Error(w, "failed to delete file: "+err.Error(), http.StatusConflict)
+		return
+	}
 	tomb := s.engine.index.MarkFileDeleted(relPath, deletedAt)
-	_ = os.Remove(fullPath)
 	cleanEmptyParents(rootDir, filepath.Dir(fullPath))
-	s.engine.index.Save()
+	s.engine.index.RequestSave()
 
 	s.engine.markSyncedActivity(fmt.Sprintf("远端同步删除: %s", relPath))
 
@@ -412,26 +463,32 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	ch := make(chan SyncEvent, 32)
 	peerLabel := r.RemoteAddr
 	if node := r.Header.Get("X-SyncT-Node"); node != "" {
 		peerLabel = node
 	}
+	sub := &subscriber{
+		events: make(chan SyncEvent, 32),
+		rescan: make(chan struct{}, 1),
+		label:  peerLabel,
+	}
 
 	s.subsMu.Lock()
-	s.subs[ch] = peerLabel
+	s.subs[sub.events] = sub
 	s.subsMu.Unlock()
 	s.engine.notifyUI()
 
 	defer func() {
 		s.subsMu.Lock()
-		delete(s.subs, ch)
+		delete(s.subs, sub.events)
 		s.subsMu.Unlock()
 		s.engine.notifyUI()
 	}()
 
 	// Send initial handshake event
-	_, _ = fmt.Fprintf(w, "event: connected\ndata: {\"node_id\":%q}\n\n", s.engine.index.NodeID())
+	if _, err := fmt.Fprintf(w, "event: connected\ndata: {\"node_id\":%q}\n\n", s.engine.index.NodeID()); err != nil {
+		return
+	}
 	flusher.Flush()
 
 	ticker := time.NewTicker(15 * time.Second)
@@ -442,7 +499,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
-		case ev, open := <-ch:
+		case ev, open := <-sub.events:
 			if !open {
 				return
 			}
@@ -450,35 +507,70 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			_, _ = fmt.Fprintf(w, "event: sync\ndata: %s\n\n", payload)
+			if _, err := fmt.Fprintf(w, "event: sync\ndata: %s\n\n", payload); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-sub.rescan:
+			payload, _ := json.Marshal(SyncEvent{Type: EventRescan, Timestamp: time.Now().UTC().UnixMilli()})
+			if _, err := fmt.Fprintf(w, "event: sync\ndata: %s\n\n", payload); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-ticker.C:
-			_, _ = fmt.Fprintf(w, ": heartbeat %d\n\n", time.Now().Unix())
+			if _, err := fmt.Fprintf(w, ": heartbeat %d\n\n", time.Now().Unix()); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}
 }
 
+// copyFileContents copies src to dst through a same-directory temporary file
+// and an atomic rename. The temporary name starts with ".synct" so watchers
+// ignore it, and readers never observe a half-written destination.
 func copyFileContents(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+
+	parent := filepath.Dir(dst)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	var randBuf [6]byte
+	_, _ = rand.Read(randBuf[:])
+	tmpPath := filepath.Join(parent, ".synct.tmp."+hex.EncodeToString(randBuf[:]))
+
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
+	buf := ioBufferPool.Get().(*[]byte)
+	_, copyErr := io.CopyBuffer(out, in, *buf)
+	ioBufferPool.Put(buf)
+	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(tmpPath)
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	}
+	if err := replaceFile(tmpPath, dst); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func cleanEmptyParents(rootDir, dir string) {
 	rootClean := filepath.Clean(rootDir)
 	for {
 		dirClean := filepath.Clean(dir)
-		if dirClean == rootClean || !strings.HasPrefix(dirClean, rootClean) {
+		if dirClean == rootClean || !isPathWithinRoot(rootClean, dirClean) {
 			return
 		}
 		entries, err := os.ReadDir(dirClean)

@@ -10,7 +10,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 )
 
 // Dedicated self-use endpoints for SyncT.
@@ -93,6 +95,16 @@ func NormalizeFolderID(id string) string {
 	return res
 }
 
+// Clone returns a deep copy so concurrent readers and the engine never share
+// backing arrays for SyncFolders/IgnorePatterns/TableColumns.
+func (c Config) Clone() Config {
+	out := c
+	out.SyncFolders = append([]FolderMapping(nil), c.SyncFolders...)
+	out.IgnorePatterns = append([]string(nil), c.IgnorePatterns...)
+	out.TableColumns = append([]string(nil), c.TableColumns...)
+	return out
+}
+
 // Config holds all persistent portable settings for SyncT.
 type Config struct {
 	SyncDir          string          `json:"sync_dir"`
@@ -130,6 +142,7 @@ func DefaultIgnorePatterns() []string {
 		".DS_Store",
 		".git",
 		"node_modules",
+		"*.conflict-*", // keep local conflict backups from bouncing between peers
 	}
 }
 
@@ -248,18 +261,28 @@ func Default() Config {
 }
 
 // Load reads Config from disk or creates a default one if missing.
+// A damaged config is preserved as config.json.corrupt-<timestamp> before a
+// clean default is written, so a later save cannot destroy the user's settings.
 func Load() (Config, error) {
 	cfg := Default()
 	data, err := os.ReadFile(ConfigPath())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			_ = Save(cfg)
+			if saveErr := Save(cfg); saveErr != nil {
+				return cfg, fmt.Errorf("创建默认配置失败: %w", saveErr)
+			}
 			return cfg, nil
 		}
-		return cfg, err
+		return cfg, fmt.Errorf("读取配置文件失败: %w", err)
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return cfg, err
+		backup := ConfigPath() + ".corrupt-" + time.Now().Format("20060102-150405")
+		_ = os.Rename(ConfigPath(), backup)
+		cfg = Default()
+		if saveErr := Save(cfg); saveErr != nil {
+			return cfg, fmt.Errorf("配置文件损坏且无法写入默认配置: %w", saveErr)
+		}
+		return cfg, fmt.Errorf("配置文件损坏，已备份至 %s: %w", filepath.Base(backup), err)
 	}
 	cfg.Normalize()
 	return cfg, nil
@@ -349,7 +372,8 @@ func (c *Config) Normalize() {
 	if c.LocalPort <= 0 || c.LocalPort > 65535 {
 		c.LocalPort = DefaultLocalPort
 	}
-	if strings.TrimSpace(c.AuthToken) == "" {
+	c.AuthToken = strings.TrimSpace(c.AuthToken)
+	if c.AuthToken == "" {
 		c.AuthToken = GenerateToken()
 	}
 	if c.SyncDirection != SyncBidirectional && c.SyncDirection != SyncPushOnly && c.SyncDirection != SyncPullOnly {
@@ -358,12 +382,40 @@ func (c *Config) Normalize() {
 	if c.ConflictPolicy != ConflictKeepBoth && c.ConflictPolicy != ConflictNewerWins {
 		c.ConflictPolicy = ConflictKeepBoth
 	}
-	if len(c.IgnorePatterns) == 0 {
-		c.IgnorePatterns = DefaultIgnorePatterns()
-	}
+	c.IgnorePatterns = normalizePatterns(c.IgnorePatterns)
 	if c.SidebarWidth < 160 || c.SidebarWidth > 420 {
 		c.SidebarWidth = 220
 	}
+}
+
+// normalizePatterns trims, drops empties and de-duplicates ignore rules so the
+// scan matcher does not evaluate the same pattern twice. Windows paths are
+// case-insensitive, so duplicates are compared case-insensitively there.
+func normalizePatterns(patterns []string) []string {
+	if len(patterns) == 0 {
+		return DefaultIgnorePatterns()
+	}
+	out := make([]string, 0, len(patterns))
+	seen := make(map[string]struct{}, len(patterns))
+	for _, raw := range patterns {
+		pat := strings.TrimSpace(raw)
+		if pat == "" {
+			continue
+		}
+		key := pat
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(key)
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, pat)
+	}
+	if len(out) == 0 {
+		return DefaultIgnorePatterns()
+	}
+	return out
 }
 
 // EnabledFolders returns all enabled folder mappings that have a non-empty LocalPath.
@@ -398,11 +450,40 @@ func (c Config) EnabledFolders() []FolderMapping {
 	return out
 }
 
+// EnabledFolderCount returns how many folder mappings are active without
+// allocating a slice (used on every UI frame).
+func (c Config) EnabledFolderCount() int {
+	count := 0
+	for _, f := range c.SyncFolders {
+		if f.Enabled && strings.TrimSpace(f.LocalPath) != "" {
+			count++
+		}
+	}
+	if count == 0 {
+		return 1
+	}
+	return count
+}
+
 // FindFolder looks up a folder mapping by ID (treating empty string as "default").
+// It iterates the mappings directly instead of calling EnabledFolders, because
+// this runs once per transferred file and per server request.
 func (c Config) FindFolder(id string) (FolderMapping, bool) {
 	id = NormalizeFolderID(id)
-	for _, f := range c.EnabledFolders() {
-		if NormalizeFolderID(f.ID) == id {
+	for i := range c.SyncFolders {
+		f := c.SyncFolders[i]
+		if NormalizeFolderID(f.ID) != id {
+			continue
+		}
+		if f.Enabled && strings.TrimSpace(f.LocalPath) != "" {
+			f.ID = id
+			if f.Label == "" {
+				if id == DefaultFolderID {
+					f.Label = "主同步目录"
+				} else {
+					f.Label = filepath.Base(f.LocalPath)
+				}
+			}
 			return f, true
 		}
 	}
@@ -420,6 +501,50 @@ func (c Config) FindFolder(id string) (FolderMapping, bool) {
 		}, true
 	}
 	return FolderMapping{}, false
+}
+
+// FindEnabledFolder returns the effective enabled mapping for a folder ID.
+// Unlike FindFolder (which is also used to display disabled mappings), it never
+// returns a disabled folder, so file transfers cannot write into a mapping the
+// user turned off. When every mapping is disabled, EnabledFolders() falls back
+// to SyncDir as the primary folder, and this method mirrors that fallback.
+func (c Config) FindEnabledFolder(id string) (FolderMapping, bool) {
+	id = NormalizeFolderID(id)
+	for i := range c.SyncFolders {
+		f := c.SyncFolders[i]
+		if NormalizeFolderID(f.ID) != id || !f.Enabled || strings.TrimSpace(f.LocalPath) == "" {
+			continue
+		}
+		f.ID = id
+		if f.Label == "" {
+			if id == DefaultFolderID {
+				f.Label = "主同步目录"
+			} else {
+				f.Label = filepath.Base(f.LocalPath)
+			}
+		}
+		return f, true
+	}
+	if id != DefaultFolderID {
+		return FolderMapping{}, false
+	}
+	for i := range c.SyncFolders {
+		if c.SyncFolders[i].Enabled && strings.TrimSpace(c.SyncFolders[i].LocalPath) != "" {
+			// Another mapping is enabled, so EnabledFolders() does not apply the
+			// primary fallback; the disabled default must stay unwritable.
+			return FolderMapping{}, false
+		}
+	}
+	dir := strings.TrimSpace(c.SyncDir)
+	if dir == "" {
+		dir = DefaultSyncDir()
+	}
+	return FolderMapping{
+		ID:        DefaultFolderID,
+		Label:     "主同步目录",
+		LocalPath: dir,
+		Enabled:   true,
+	}, true
 }
 
 // UpsertFolder adds or updates a folder mapping by ID and keeps SyncDir synchronized with the primary folder.
@@ -485,14 +610,18 @@ func Save(c Config) error {
 	c.Normalize()
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("编码配置失败: %w", err)
 	}
 	path := ConfigPath()
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+		return fmt.Errorf("写入配置失败: %w", err)
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("提交配置失败: %w", err)
+	}
+	return nil
 }
 
 // SharePayload represents the encoded share URI payload.

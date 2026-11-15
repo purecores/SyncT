@@ -312,5 +312,3 @@ func TestMultiFolderAndCrossTargetMappingSync(t *testing.T) {
 		t.Fatalf("expected weekly.txt in hostReportsTargetDir, got %q (%v)", string(gotWeekly), err)
 	}
 }
-
-

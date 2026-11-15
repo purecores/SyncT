@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -144,14 +145,16 @@ type dualProtocolListener struct {
 	connCh    chan net.Conn
 	closeOnce sync.Once
 	closedCh  chan struct{}
+	onError   func(error)
 }
 
-func newDualProtocolListener(listeners []net.Listener, tlsConfig *tls.Config) *dualProtocolListener {
+func newDualProtocolListener(listeners []net.Listener, tlsConfig *tls.Config, onError func(error)) *dualProtocolListener {
 	dl := &dualProtocolListener{
 		listeners: listeners,
 		tlsConfig: tlsConfig,
 		connCh:    make(chan net.Conn, 64),
 		closedCh:  make(chan struct{}),
+		onError:   onError,
 	}
 	for _, ln := range listeners {
 		go dl.acceptLoop(ln)
@@ -167,8 +170,13 @@ func (dl *dualProtocolListener) acceptLoop(ln net.Listener) {
 			case <-dl.closedCh:
 				return
 			default:
-				return
 			}
+			// A listener that stops accepting without being closed would leave
+			// the sync endpoint silently dead; surface it to the engine log.
+			if dl.onError != nil {
+				dl.onError(fmt.Errorf("监听 %s 的接收循环终止: %w", ln.Addr(), err))
+			}
+			return
 		}
 		go dl.dispatchConn(rawConn)
 	}

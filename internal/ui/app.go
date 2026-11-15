@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -85,8 +86,26 @@ type App struct {
 	// Power keep-awake release callback
 	keepAwakeRelease func()
 
+	// fileCache reuses the filtered/sorted file table across frames. The view
+	// rebuilds only when the index generation or a filter actually changes.
+	fileCache fileViewCache
+
+	// binaryRefreshTimer debounces cloudflared --version probes while typing.
+	binaryRefreshTimer *time.Timer
+
 	// Optional hook for directory picker (allows deterministic testing)
 	PickFolderFunc func(current string) (string, error)
+}
+
+type fileViewCache struct {
+	files    []syncer.FileEntry
+	version  uint64
+	search   string
+	filter   int
+	sortCol  string
+	sortDesc bool
+	result   []syncer.FileEntry
+	valid    bool
 }
 
 // NewApp constructs the SyncT application state.
@@ -105,6 +124,16 @@ func NewApp(cfg config.Config, statePath string) *App {
 	}
 
 	app.engine = syncer.NewEngine(cfg, statePath, app.requestRedraw)
+	app.engine.SetConfigChangeHandler(func(updated config.Config) {
+		win := app.win
+		if win == nil {
+			return // Headless test mode
+		}
+		win.Update(func() {
+			app.cfg = updated
+			app.requestRedraw()
+		})
+	})
 	app.tunnel = tunnel.NewManager(cfg.CloudflaredPath, app.requestRedraw, func(pubURL string) {
 		app.engine.Logf("Cloudflared 公网隧道已就绪: %s", pubURL)
 		app.requestRedraw()
@@ -142,10 +171,20 @@ func (app *App) requestRedraw() {
 	}
 }
 
+// saveConfig persists the UI's configuration copy and surfaces failures instead
+// of silently dropping user settings.
+func (app *App) saveConfig() {
+	if err := config.Save(app.cfg); err != nil {
+		app.engine.LogLevel("WARN", "保存配置失败: "+err.Error())
+		app.pendingToast = "保存配置失败: " + err.Error()
+		app.requestRedraw()
+	}
+}
+
 // StartAll starts the sync engine and (when in Host mode) the Cloudflared tunnel.
 func (app *App) StartAll() error {
 	app.syncFieldsToConfig()
-	_ = config.Save(app.cfg)
+	app.saveConfig()
 	app.engine.UpdateConfig(app.cfg)
 
 	if err := app.engine.Start(); err != nil {
@@ -259,7 +298,7 @@ func (app *App) View(c *ui.Context) {
 		app.cfg = config.Default()
 		app.roleIndex = 0
 		app.portInput = strconv.Itoa(app.cfg.LocalPort)
-		_ = config.Save(app.cfg)
+		app.saveConfig()
 		app.engine.UpdateConfig(app.cfg)
 		c.Toast("已恢复默认便携配置")
 	}
@@ -287,7 +326,7 @@ func (app *App) buildToolbar(c *ui.Context, t *ui.Theme) {
 				app.StopAll()
 			}
 			app.syncFieldsToConfig()
-			_ = config.Save(app.cfg)
+			app.saveConfig()
 			app.engine.UpdateConfig(app.cfg)
 			if app.cfg.Role == config.RoleHost {
 				c.Toast("已切换为主机模式：开启 Cloudflared 隧道共享文件夹")
@@ -360,7 +399,7 @@ func (app *App) buildToolbar(c *ui.Context, t *ui.Theme) {
 
 func (app *App) buildSidebar(c *ui.Context, t *ui.Theme) {
 	stats := app.engine.Stats()
-	logsCount := len(app.engine.Logs()) + len(app.tunnel.Logs())
+	logsCount := app.engine.LogCount() + app.tunnel.LogCount()
 
 	ui.Column(c).Fill().Background(t.Surface).Children(func() {
 		ui.Sidebar(c, &app.section, func() {
@@ -392,7 +431,7 @@ func (app *App) buildSidebar(c *ui.Context, t *ui.Theme) {
 }
 
 func (app *App) buildBottomLeftSyncInfo(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
-	folderCnt := max(stats.FolderCount, len(app.cfg.EnabledFolders()))
+	folderCnt := max(stats.FolderCount, 1)
 	ui.Column(c).Padding(t.Space(2.5)).Gap(t.Space(1.5)).Background(t.Surface).Children(func() {
 		ui.Row(c).Gap(t.Space(1.5)).Children(func() {
 			ui.Icon(c, IconActivity).TextColor(t.Accent)
@@ -467,8 +506,11 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 			})
 
 			// Error banner if any
-			if stats.LastError != "" || tunErr != "" {
+			if stats.LastError != "" || stats.LastScanError != "" || tunErr != "" {
 				errMsg := stats.LastError
+				if errMsg == "" {
+					errMsg = stats.LastScanError
+				}
 				if errMsg == "" {
 					errMsg = tunErr
 				}
@@ -510,7 +552,7 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 								if len(app.cfg.SyncFolders) > 0 {
 									app.cfg.SyncFolders[0].LocalPath = app.cfg.SyncDir
 								}
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 							}
 							if ui.Button(c.Key("btn-browse-dir"), "浏览选择…").Clicked() {
 								app.pickSyncDirectory(c)
@@ -524,7 +566,7 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 						choice := syncDirOptions[dirIdx]
 						if ui.Select(c.Key("sel-sync-dir"), &choice, syncDirOptions).Label("实时同步模式").Changed() {
 							app.cfg.SyncDirection = parseSyncDirection(choice)
-							_ = config.Save(app.cfg)
+							app.saveConfig()
 							app.engine.UpdateConfig(app.cfg)
 							c.Toast("同步方向已更新为: " + choice)
 						}
@@ -540,7 +582,7 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 							ui.Toggle(c.Key("toggle-show-token"), &app.showToken, "显示密钥")
 							if ui.Button(c.Key("btn-gen-token"), "随机生成").Clicked() {
 								app.cfg.AuthToken = config.GenerateToken()
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 								app.engine.UpdateConfig(app.cfg)
 								c.Toast("已生成新的随机访问密钥")
 							}
@@ -556,7 +598,7 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 								choice := tunnelModeOptions[tmIdx]
 								if ui.Select(c.Key("sel-tunnel-mode"), &choice, tunnelModeOptions).Label("隧道运行方式").Changed() {
 									app.cfg.TunnelMode = parseTunnelMode(choice)
-									_ = config.Save(app.cfg)
+									app.saveConfig()
 									c.Toast("已切换隧道模式: " + choice)
 								}
 							}).Description("默认直接复用本机系统已在运行的 Cloudflared 服务，无需重复启动进程或填写 Token")
@@ -574,7 +616,7 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 
 								ui.Field(c, "绑定的公网域名", func() {
 									if ui.TextInput(c.Key("input-custom-pub-url"), &app.cfg.CustomPublicURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
-										_ = config.Save(app.cfg)
+										app.saveConfig()
 									}
 								}).Description("已预设系统 Cloudflared 绑定的专属域名 https://synctreei.suosmanthus.cyou")
 							}
@@ -586,7 +628,7 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 
 								ui.Field(c, "绑定的公网域名", func() {
 									if ui.TextInput(c.Key("input-custom-pub-url"), &app.cfg.CustomPublicURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
-										_ = config.Save(app.cfg)
+										app.saveConfig()
 									}
 								}).Description("已预设自用专属域名 https://synctreei.suosmanthus.cyou")
 							}
@@ -599,7 +641,7 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 								ui.Row(c).Gap(t.Space(2)).Children(func() {
 									if ui.TextInput(c.Key("input-local-port"), &app.portInput).Placeholder("18920").Grow(1).Changed() {
 										app.syncFieldsToConfig()
-										_ = config.Save(app.cfg)
+										app.saveConfig()
 									}
 									ui.Badge(c, fmt.Sprintf("https://localhost:%s", strings.TrimSpace(app.portInput))).
 										Background(t.Accent.Alpha(0.15)).TextColor(t.Accent)
@@ -640,7 +682,7 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 							}
 							ui.Field(c, "远端隧道地址", func() {
 								if ui.TextInput(c.Key("input-remote-url"), &app.cfg.RemoteURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
-									_ = config.Save(app.cfg)
+									app.saveConfig()
 									app.engine.UpdateConfig(app.cfg)
 								}
 							}).Description("已默认预设为 https://synctreei.suosmanthus.cyou").Error(remoteErr)
@@ -697,12 +739,8 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 
 				ui.Row(c).Gap(t.Space(2)).Children(func() {
 					if ui.Button(c.Key("btn-detect-cf"), "重新检测组件").Clicked() {
-						p, v := app.tunnel.RefreshBinary(app.cfg.CloudflaredPath)
-						if p != "" {
-							c.Toast("已检测到 Cloudflared: " + v)
-						} else {
-							c.Toast("未检测到 cloudflared.exe")
-						}
+						app.refreshBinaryAsync()
+						c.Toast("正在重新检测 Cloudflared 组件…")
 					}
 					if ui.Button(c.Key("btn-dl-cf"), "自动下载便携版 cloudflared.exe").Disabled(downloading).Clicked() {
 						c.Toast("开始下载官方便携版 cloudflared.exe 至 bin 目录…")
@@ -722,8 +760,8 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 }
 
 func (app *App) buildFilesPage(c *ui.Context, t *ui.Theme) {
-	allFiles := app.engine.Files()
-	filtered := app.filterAndSortFiles(allFiles)
+	allFiles, version := app.engine.FilesWithVersion()
+	filtered := app.cachedVisibleFiles(allFiles, version)
 
 	ui.Column(c).Fill().Padding(t.Space(4)).Gap(t.Space(3)).Children(func() {
 		// Search & filter bar
@@ -931,7 +969,7 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 								Placeholder("输入通配符 (如 *.tmp, .git) 按回车添加…").
 								Label("忽略规则列表").
 								Changed() {
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 								app.engine.UpdateConfig(app.cfg)
 								c.Toast("已更新忽略规则并重新过滤文件")
 							}
@@ -942,7 +980,7 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 							choice := conflictOptions[confIdx]
 							if ui.Select(c.Key("sel-conflict-policy"), &choice, conflictOptions).Label("版本冲突策略").Changed() {
 								app.cfg.ConflictPolicy = parseConflictPolicy(choice)
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 								app.engine.UpdateConfig(app.cfg)
 								c.Toast("冲突策略已更新: " + choice)
 							}
@@ -950,7 +988,7 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 
 						ui.Field(c, "同步文件删除", func() {
 							if ui.Switch(c.Key("sw-sync-del"), &app.cfg.SyncDeletions).Label("同步文件删除").Changed() {
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 								app.engine.UpdateConfig(app.cfg)
 								c.Toast("已更新文件删除同步开关")
 							}
@@ -963,22 +1001,24 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 								if ui.TextInput(c.Key("input-cf-path"), &app.cfg.CloudflaredPath).
 									Placeholder("留空则自动按 ./bin/cloudflared.exe -> 系统 PATH 顺序查找").
 									Grow(1).Changed() {
-									_ = config.Save(app.cfg)
-									app.tunnel.RefreshBinary(app.cfg.CloudflaredPath)
+									app.saveConfig()
+									// Probe asynchronously and debounced: `cloudflared --version`
+									// can take seconds and must never block the UI thread.
+									app.scheduleBinaryRefresh()
 								}
 							})
 						}).Description("便携移动使用时可将 cloudflared.exe 放在软件同级的 bin 目录中")
 
 						ui.Field(c, "自动启动同步", func() {
 							if ui.Switch(c.Key("sw-autostart"), &app.cfg.AutoStartSync).Label("自动启动同步").Changed() {
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 								c.Toast("已保存自动启动同步选项")
 							}
 						}).Description("打开 SyncT.exe 时立即按照上次保存的配置启动隧道与实时同步")
 
 						ui.Field(c, "防止系统休眠", func() {
 							if ui.Switch(c.Key("sw-keepawake"), &app.cfg.KeepAwake).Label("防止系统休眠").Changed() {
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 								app.updateKeepAwake(app.engine.IsRunning())
 								c.Toast("已更新电源唤醒保持策略")
 							}
@@ -986,14 +1026,14 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 
 						ui.Field(c, "最小化到托盘", func() {
 							if ui.Switch(c.Key("sw-tray"), &app.cfg.MinimizeToTray).Label("最小化到托盘").Changed() {
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 								c.Toast("已更新关闭窗口最小化至系统托盘设置")
 							}
 						}).Description("点击窗口关闭按钮时隐藏到 Windows 11 右下角系统托盘继续后台实时同步")
 
 						ui.Field(c, "User 权限克制模式", func() {
 							if ui.Switch(c.Key("sw-lowpriv"), &app.cfg.LowPrivilegeMode).Label("User 权限克制模式").Changed() {
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 								c.Toast("已更新 User 权限克制模式策略")
 							}
 						}).Description("专为受限 User 权限工作电脑设计：强制 asInvoker 权限清单、仅绑定回环地址、窗口状态与缓存全部隔离在 ./data/ 目录")
@@ -1096,7 +1136,7 @@ func (app *App) buildFolderMappingsSection(c *ui.Context, t *ui.Theme) {
 								if isDefault {
 									app.cfg.SyncDir = chosen
 								}
-								_ = config.Save(app.cfg)
+								app.saveConfig()
 								app.engine.UpdateConfig(app.cfg)
 							}
 						})
@@ -1121,7 +1161,7 @@ func (app *App) buildFolderMappingsSection(c *ui.Context, t *ui.Theme) {
 
 		if changed {
 			app.cfg.Normalize()
-			_ = config.Save(app.cfg)
+			app.saveConfig()
 			app.engine.UpdateConfig(app.cfg)
 		}
 
@@ -1178,7 +1218,7 @@ func (app *App) buildFolderMappingsSection(c *ui.Context, t *ui.Theme) {
 					app.newFolderLabel = ""
 					app.newFolderLocal = ""
 					app.newFolderRemote = ""
-					_ = config.Save(app.cfg)
+					app.saveConfig()
 					app.engine.UpdateConfig(app.cfg)
 					c.Toast(fmt.Sprintf("已添加同步文件夹映射: %s (%s)", lbl, id))
 				}
@@ -1233,7 +1273,7 @@ func (app *App) pickSyncDirectory(c *ui.Context) {
 		if len(app.cfg.SyncFolders) > 0 {
 			app.cfg.SyncFolders[0].LocalPath = chosen
 		}
-		_ = config.Save(app.cfg)
+		app.saveConfig()
 		app.engine.UpdateConfig(app.cfg)
 	})
 }
@@ -1249,9 +1289,68 @@ func (app *App) applyShareCodeInput(c *ui.Context) {
 		app.cfg.AuthToken = tok
 	}
 	app.shareInput = ""
-	_ = config.Save(app.cfg)
+	app.saveConfig()
 	app.engine.UpdateConfig(app.cfg)
 	c.Toast("已成功导入隧道地址与访问密钥")
+}
+
+// scheduleBinaryRefresh debounces cloudflared version probes triggered by typing.
+func (app *App) scheduleBinaryRefresh() {
+	path := app.cfg.CloudflaredPath
+	if app.binaryRefreshTimer != nil {
+		app.binaryRefreshTimer.Stop()
+	}
+	app.binaryRefreshTimer = time.AfterFunc(600*time.Millisecond, func() {
+		binPath, version := app.tunnel.RefreshBinary(path)
+		app.postBinaryRefreshToast(binPath, version)
+	})
+}
+
+// refreshBinaryAsync probes the binary off the UI thread (button click).
+func (app *App) refreshBinaryAsync() {
+	path := app.cfg.CloudflaredPath
+	go func() {
+		binPath, version := app.tunnel.RefreshBinary(path)
+		app.postBinaryRefreshToast(binPath, version)
+	}()
+}
+
+func (app *App) postBinaryRefreshToast(binPath, version string) {
+	if app.win == nil {
+		return // Headless test mode
+	}
+	app.win.Update(func() {
+		if binPath != "" {
+			app.pendingToast = "已检测到 Cloudflared: " + version
+		} else {
+			app.pendingToast = "未检测到 cloudflared.exe"
+		}
+	})
+}
+
+// cachedVisibleFiles avoids re-filtering and re-sorting the whole table on
+// every frame; it only rebuilds when the index version or a filter changes.
+func (app *App) cachedVisibleFiles(files []syncer.FileEntry, version uint64) []syncer.FileEntry {
+	cache := &app.fileCache
+	if cache.valid &&
+		cache.version == version &&
+		cache.search == app.fileSearch &&
+		cache.filter == app.fileFilterIdx &&
+		cache.sortCol == app.fileSort.Column &&
+		cache.sortDesc == app.fileSort.Descending &&
+		len(cache.files) == len(files) {
+		return cache.result
+	}
+	result := app.filterAndSortFiles(files)
+	cache.files = files
+	cache.version = version
+	cache.search = app.fileSearch
+	cache.filter = app.fileFilterIdx
+	cache.sortCol = app.fileSort.Column
+	cache.sortDesc = app.fileSort.Descending
+	cache.result = result
+	cache.valid = true
+	return result
 }
 
 func (app *App) filterAndSortFiles(files []syncer.FileEntry) []syncer.FileEntry {

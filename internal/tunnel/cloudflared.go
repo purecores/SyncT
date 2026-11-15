@@ -238,6 +238,13 @@ func (m *Manager) Logs() []string {
 	return out
 }
 
+// LogCount returns the number of buffered log lines without copying them.
+func (m *Manager) LogCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.logs)
+}
+
 // ClearLogs clears the tunnel output log buffer.
 func (m *Manager) ClearLogs() {
 	m.mu.Lock()
@@ -564,6 +571,7 @@ func (m *Manager) DownloadPortableBinary(onDone func(path string, err error)) {
 
 		out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 		if err != nil {
+			m.appendLog(fmt.Sprintf("[错误] 无法创建下载临时文件: %v", err))
 			if onDone != nil {
 				onDone("", err)
 			}
@@ -579,6 +587,7 @@ func (m *Manager) DownloadPortableBinary(onDone func(path string, err error)) {
 				if _, werr := out.Write(buf[:n]); werr != nil {
 					_ = out.Close()
 					_ = os.Remove(tmpPath)
+					m.appendLog(fmt.Sprintf("[错误] 写入 cloudflared.exe 失败: %v", werr))
 					if onDone != nil {
 						onDone("", werr)
 					}
@@ -596,6 +605,7 @@ func (m *Manager) DownloadPortableBinary(onDone func(path string, err error)) {
 			if rerr != nil {
 				_ = out.Close()
 				_ = os.Remove(tmpPath)
+				m.appendLog(fmt.Sprintf("[错误] 下载中断: %v", rerr))
 				if onDone != nil {
 					onDone("", rerr)
 				}
@@ -603,10 +613,20 @@ func (m *Manager) DownloadPortableBinary(onDone func(path string, err error)) {
 			}
 		}
 		_ = out.Close()
+		if total > 0 && written != total {
+			err := fmt.Errorf("下载不完整: %d/%d 字节", written, total)
+			_ = os.Remove(tmpPath)
+			m.appendLog("[错误] " + err.Error())
+			if onDone != nil {
+				onDone("", err)
+			}
+			return
+		}
 
 		_ = os.Remove(targetPath)
 		if err := os.Rename(tmpPath, targetPath); err != nil {
 			_ = os.Remove(tmpPath)
+			m.appendLog(fmt.Sprintf("[错误] 保存 cloudflared.exe 失败: %v", err))
 			if onDone != nil {
 				onDone("", err)
 			}
@@ -627,7 +647,9 @@ func (m *Manager) appendLog(line string) {
 	m.mu.Lock()
 	m.logs = append(m.logs, entry)
 	if len(m.logs) > 300 {
-		m.logs = append([]string(nil), m.logs[len(m.logs)-300:]...)
+		// Trim in place: no per-line allocation once the buffer is full.
+		copy(m.logs, m.logs[len(m.logs)-300:])
+		m.logs = m.logs[:300]
 	}
 	m.mu.Unlock()
 	m.notify()
