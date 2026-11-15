@@ -1,0 +1,8 @@
+.alma-snapshots/
+data/
+SyncFolder/
+release/
+bin/
+*.exe
+*.test
+*.out
