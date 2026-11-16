@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,6 +41,12 @@ const (
 	watchRetryMax       = 30 * time.Second
 )
 
+// Host-side health check cadence. Variables so tests can shorten them.
+var (
+	hostHealthInterval  = 15 * time.Second
+	publicProbeInterval = 60 * time.Second
+)
+
 // EngineState represents the high-level runtime state of the synchronization engine.
 type EngineState string
 
@@ -65,6 +72,7 @@ type Stats struct {
 	State           EngineState
 	LastError       string
 	LocalPort       int
+	HealthWarning   string
 	ConnectedPeers  int
 	RemoteConnected bool
 	RemoteNodeID    string
@@ -83,6 +91,10 @@ type Stats struct {
 	LastScanTime    time.Time
 	LastScanError   string
 	ScanErrors      int64
+	// TLSRejected reports that cloudflared refused the local self-signed
+	// certificate, which makes the public tunnel answer 502 until the cert is
+	// trusted (or the ingress sets noTLSVerify).
+	TLSRejected bool
 }
 
 // Engine coordinates local folder watching (`mygo.WatchFiles`), the Host HTTP/SSE server,
@@ -98,6 +110,7 @@ type Engine struct {
 
 	state           EngineState
 	lastError       string
+	healthWarning   string
 	localPort       int
 	remoteConnected bool
 	remoteNodeID    string
@@ -117,6 +130,7 @@ type Engine struct {
 	conflictsSaved  atomic.Int64
 	scanErrors      atomic.Int64
 	logSeq          atomic.Int64
+	tlsRejected     atomic.Bool
 
 	logsMu sync.RWMutex
 	logs   []LogEntry
@@ -145,8 +159,15 @@ type Engine struct {
 
 // NewEngine creates a new Synchronization Engine.
 func NewEngine(cfg config.Config, statePath string, onUpdate func()) *Engine {
+	// A caller passing 0 explicitly asks for an OS-assigned port (tests and
+	// embedded use). Normalize fills production defaults, so preserve that
+	// intent instead of pinning every test host to the production port.
+	autoPort := cfg.LocalPort == 0
 	cfg = cfg.Clone()
 	cfg.Normalize()
+	if autoPort {
+		cfg.LocalPort = 0
+	}
 	tr := newSyncHTTPTransport()
 	if tr.ResponseHeaderTimeout == 0 {
 		tr.ResponseHeaderTimeout = 45 * time.Second
@@ -213,8 +234,12 @@ func (e *Engine) Config() config.Config {
 // folders or ignore rules changed. The scan runs in the background so the UI
 // thread never blocks on large directories.
 func (e *Engine) UpdateConfig(cfg config.Config) {
+	autoPort := cfg.LocalPort == 0
 	cfg = cfg.Clone()
 	cfg.Normalize()
+	if autoPort {
+		cfg.LocalPort = 0
+	}
 
 	e.mu.Lock()
 	foldersChanged := e.cfg.SyncDir != cfg.SyncDir || !sameFolderMappings(e.cfg.SyncFolders, cfg.SyncFolders)
@@ -425,8 +450,17 @@ func (e *Engine) Start() error {
 	}
 	e.index.RequestSave()
 
+	if ctx.Err() != nil {
+		// Stop was pressed while the initial scan ran; do not bind listeners
+		// for an engine the user already stopped.
+		e.Stop()
+		return ctx.Err()
+	}
+
 	if cfg.Role == config.RoleHost {
-		port, err := e.server.Start(cfg.LocalPort)
+		// LAN Direct is the one mode that genuinely needs non-loopback binds;
+		// every mode keeps loopback-only otherwise so no firewall prompt fires.
+		port, err := e.server.Start(cfg.LocalPort, cfg.TunnelMode == config.TunnelDirect)
 		if err != nil {
 			e.Stop()
 			e.setError(fmt.Sprintf("启动本地同步服务失败: %v", err))
@@ -440,10 +474,15 @@ func (e *Engine) Start() error {
 		e.notifyUI()
 
 		go e.watchLocalLoop(ctx)
+		go e.hostHealthLoop(ctx, port)
 		return nil
 	}
 
 	// Client mode
+	if ctx.Err() != nil {
+		e.Stop()
+		return ctx.Err()
+	}
 	remoteURL := config.NormalizeRemoteURL(cfg.RemoteURL)
 	if remoteURL == "" {
 		e.Stop()
@@ -919,6 +958,18 @@ func (e *Engine) runLocalScan(ctx context.Context, pending map[string]struct{}, 
 	e.notifyUI()
 }
 
+// reconnectDelay adds jitter to a reconnect backoff. Without it, both peers
+// reconnecting after a shared outage retry in lockstep and keep colliding;
+// with the origin rebinding on the Host side, synchronized retries also hide
+// how long the work PC actually stays down.
+func reconnectDelay(backoff time.Duration) time.Duration {
+	if backoff <= 0 {
+		return 0
+	}
+	jitter := time.Duration(mathrand.Int63n(int64(backoff) / 2))
+	return backoff + jitter
+}
+
 func (e *Engine) clientLoop(ctx context.Context) {
 	backoff := time.Second
 	for ctx.Err() == nil {
@@ -937,7 +988,7 @@ func (e *Engine) clientLoop(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(backoff):
+			case <-time.After(reconnectDelay(backoff)):
 			}
 			if backoff < 15*time.Second {
 				backoff *= 2
@@ -995,7 +1046,7 @@ func (e *Engine) clientLoop(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(backoff):
+				case <-time.After(reconnectDelay(backoff)):
 				}
 				break inner
 			case <-e.reconcileWake:
@@ -1177,7 +1228,7 @@ func (e *Engine) listenRemoteEvents(ctx context.Context) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("SSE 状态码 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return remoteStatusError("实时事件流", resp.StatusCode, string(body))
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -1392,6 +1443,29 @@ func (e *Engine) processRemoteEventsLocked(ctx context.Context, pending map[stri
 	return needReconcile
 }
 
+// remoteStatusError turns a non-200 reply from the tunnel into an actionable
+// message. 502 from Cloudflare means the work PC reached the edge but the
+// host's origin was unreachable; retrying forever without saying why leaves
+// the user staring at "远端返回状态码 502" with no hint of what to fix.
+func remoteStatusError(action string, status int, body string) error {
+	detail := strings.TrimSpace(body)
+	if len(detail) > 200 {
+		detail = detail[:200]
+	}
+	switch status {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		msg := fmt.Sprintf("%s失败: 公网隧道返回 %d (源站不可达)。请确认主机端 SyncT 正在运行且本地监听端口 (18920) 未被占用，并重启主机端同步以恢复 Cloudflared 回源。", action, status)
+		if detail != "" {
+			msg += " 响应: " + detail
+		}
+		return errors.New(msg)
+	}
+	if detail == "" {
+		return fmt.Errorf("%s失败: 远端返回状态码 %d", action, status)
+	}
+	return fmt.Errorf("%s失败: 远端返回状态码 %d: %s", action, status, detail)
+}
+
 func (e *Engine) fetchRemoteManifest(ctx context.Context, baseURL, token string, localFolders []config.FolderMapping) (Manifest, error) {
 	payload, err := json.Marshal(struct {
 		Folders []config.FolderMapping `json:"folders"`
@@ -1422,7 +1496,7 @@ func (e *Engine) fetchRemoteManifest(ctx context.Context, baseURL, token string,
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return Manifest{}, fmt.Errorf("远端返回状态码 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return Manifest{}, remoteStatusError("获取远端清单", resp.StatusCode, string(body))
 	}
 
 	var m Manifest
@@ -1771,6 +1845,7 @@ func (e *Engine) Stats() Stats {
 		State:           e.state,
 		LastError:       e.lastError,
 		LocalPort:       e.localPort,
+		HealthWarning:   e.healthWarning,
 		ConnectedPeers:  e.server.ConnectedPeers(),
 		RemoteConnected: e.remoteConnected,
 		RemoteNodeID:    e.remoteNodeID,
@@ -1787,6 +1862,7 @@ func (e *Engine) Stats() Stats {
 		LastScanTime:    e.lastScanTime,
 		LastScanError:   e.lastScanError,
 		ScanErrors:      e.scanErrors.Load(),
+		TLSRejected:     e.tlsRejected.Load(),
 	}
 	e.mu.RUnlock()
 
@@ -1885,6 +1961,148 @@ func (e *Engine) setScanFailure(err error) {
 	e.mu.Unlock()
 	e.scanErrors.Add(1)
 	e.notifyUI()
+}
+
+// hostHealthLoop keeps the published origin honest on the Host machine:
+//   - it probes the local listener so a dead origin is rebound long before a
+//     peer notices, and
+//   - when a public URL is configured it periodically asks that URL, which is
+//     the cloudflared -> origin path the work PC actually uses. A 502 there
+//     while the local listener answers means the tunnel and the origin
+//     disagree (stale ingress, wrong port, recreated tunnel); a 502 while the
+//     local listener is dead is repaired by rebinding the origin.
+func (e *Engine) hostHealthLoop(ctx context.Context, port int) {
+	localTicker := time.NewTicker(hostHealthInterval)
+	publicTicker := time.NewTicker(publicProbeInterval)
+	defer localTicker.Stop()
+	defer publicTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-localTicker.C:
+			if !e.server.IsServing() || !e.probeLocal(port) {
+				e.LogThrottled("origin-health", "WARN", "本地同步源站无响应，正在自动重建监听以恢复 Cloudflared 隧道", 30*time.Second)
+				restartErr := e.server.Restart()
+				if restartErr != nil {
+					e.setHealthWarning(fmt.Sprintf("本地同步源站重建失败: %v", restartErr))
+					continue
+				}
+				// Only clear a warning this loop owns; a 502 reported by the
+				// public probe describes the tunnel and must survive.
+				e.clearOriginWarning()
+			}
+		case <-publicTicker.C:
+			baseURL := config.NormalizeRemoteURL(e.Config().CustomPublicURL)
+			if baseURL == "" {
+				continue
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			status, err := e.probeURL(probeCtx, baseURL+"/api/status")
+			cancel()
+			switch {
+			case err != nil:
+				e.LogThrottled("public-probe:"+err.Error(), "WARN",
+					fmt.Sprintf("公网隧道健康检查失败 (%s): %v", baseURL, err), 2*time.Minute)
+			case status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout:
+				if e.probeLocal(port) {
+					// The origin answers on loopback, so cloudflared's failure to
+					// reach it is about TLS trust, not the listener.
+					e.noteTLSRejection()
+					e.LogThrottled(fmt.Sprintf("public-502:%d", status), "ERROR",
+						fmt.Sprintf("公网地址 %s 返回 %d：本地源站正常，问题在 Cloudflared 回源 TLS 校验。请开启隧道源的 No TLS Verify，或安装本地证书到受信任根。", baseURL, status),
+						time.Minute)
+				} else {
+					msg := fmt.Sprintf("公网地址 %s 返回 %d (Bad Gateway)：Cloudflared 已在线，但其回源目标 https://localhost:%d 不可达。请确认主机端 SyncT 已启动同步且端口未被占用。", baseURL, status, port)
+					e.LogThrottled(fmt.Sprintf("public-502:%d", status), "ERROR", msg, time.Minute)
+					e.setHealthWarning(msg)
+				}
+			case status == http.StatusUnauthorized, status >= 200 && status < 400:
+				// 401 means cloudflared reached the origin and only this
+				// unauthenticated probe was rejected; both ends are healthy.
+				e.clearTLSRejection()
+				e.clearHealthWarning()
+			}
+		}
+	}
+}
+
+// probeLocal asks the local loopback origin for /api/status without auth.
+// Any HTTP response, including 401, proves the listener and TLS path work.
+func (e *Engine) probeLocal(port int) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	status, err := e.probeURL(ctx, fmt.Sprintf("http://127.0.0.1:%d/api/status", port))
+	return err == nil && status > 0 && status < 500
+}
+
+func (e *Engine) probeURL(ctx context.Context, u string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-SyncT-Node", e.index.NodeID())
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode, nil
+}
+
+// noteTLSRejection records that the tunnel's origin client refused SyncT's
+// self-signed certificate. Nothing on the SyncT side can complete that
+// handshake: cloudflared must either skip verification (noTLSVerify) or trust
+// the certificate installed on this machine.
+func (e *Engine) noteTLSRejection() {
+	if e.tlsRejected.Swap(true) {
+		return
+	}
+	e.setHealthWarning("Cloudflared 拒绝了 SyncT 的本地自签名证书 (x509: certificate signed by unknown authority)，因此公网地址返回 502。可点击「修复 502」把本地证书安装到本机受信任根，或在 Cloudflare 控制台开启 No TLS Verify / 将源站改为 http://localhost:18920。")
+	e.LogThrottled("tls-trust-hint", "WARN", "TLS 排查：cloudflared 日志 C:\\ProgramData\\cloudflared\\cloudflared.log 中的 x509 unknown authority 表示自签名证书未被信任", 5*time.Minute)
+	e.notifyUI()
+}
+
+func (e *Engine) clearTLSRejection() {
+	if e.tlsRejected.CompareAndSwap(true, false) {
+		e.notifyUI()
+	}
+}
+
+func (e *Engine) setHealthWarning(msg string) {
+	e.mu.Lock()
+	changed := e.healthWarning != msg
+	e.healthWarning = msg
+	e.mu.Unlock()
+	if changed {
+		e.notifyUI()
+	}
+}
+
+// clearOriginWarning drops only the origin-recovery warning; a tunnel warning
+// is cleared by the public probe that raised it.
+func (e *Engine) clearOriginWarning() {
+	e.mu.Lock()
+	changed := e.healthWarning != "" && !strings.HasPrefix(e.healthWarning, "公网地址")
+	if changed {
+		e.healthWarning = ""
+	}
+	e.mu.Unlock()
+	if changed {
+		e.notifyUI()
+	}
+}
+
+func (e *Engine) clearHealthWarning() {
+	e.mu.Lock()
+	changed := e.healthWarning != ""
+	e.healthWarning = ""
+	e.mu.Unlock()
+	if changed {
+		e.notifyUI()
+	}
 }
 
 func (e *Engine) setScanSuccess() {

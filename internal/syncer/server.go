@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"synct/internal/config"
@@ -54,6 +56,17 @@ type Server struct {
 	listener net.Listener
 	httpSrv  *http.Server
 
+	// lifeMu serializes Start/Stop/Restart and the automatic origin recovery
+	// below; gen identifies the current listener so a serve goroutine that
+	// returns late cannot revive a listener the engine already replaced.
+	lifeMu     sync.Mutex
+	port       int
+	allowLAN   bool
+	gen        uint64
+	restartGen uint64
+	stopped    atomic.Bool
+	serving    atomic.Bool
+
 	subsMu sync.Mutex
 	subs   map[chan SyncEvent]*subscriber
 }
@@ -66,35 +79,74 @@ func NewServer(engine *Engine) *Server {
 	}
 }
 
-// Start binds to loopback `127.0.0.1:<port>` and `[::1]:<port>` (`localhost:<port>`)
-// and serves both HTTPS (`https://localhost:18920`) and HTTP requests without triggering Windows Firewall UAC prompts.
-func (s *Server) Start(port int) (int, error) {
-	addr4 := fmt.Sprintf("127.0.0.1:%d", port)
-	ln4, err := net.Listen("tcp4", addr4)
+// Start binds loopback (`127.0.0.1:<port>` and `[::1]:<port>`) and serves both
+// HTTPS (`https://localhost:18920`) and HTTP requests without triggering Windows
+// Firewall UAC prompts. allowLAN additionally binds all interfaces for the
+// explicit LAN Direct mode, whose advertised address is a LAN IP.
+func (s *Server) Start(port int, allowLAN bool) (int, error) {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	s.stopped.Store(false)
+	return s.startLocked(port, allowLAN)
+}
+
+// startLocked binds the listeners and starts serving. The caller holds lifeMu.
+// A fixed port is never silently replaced: cloudflared's ingress forwards to
+// exactly that port, and listening elsewhere while the tunnel stays pointed at
+// the configured port is what makes the work PC see a bare 502.
+func (s *Server) startLocked(port int, allowLAN bool) (int, error) {
+	// Bind loopback first and strictly: on Windows a wildcard bind can
+	// succeed next to another process's specific bind, which would silently
+	// leave loopback traffic (and cloudflared) talking to the other process.
+	ln4, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
-		// Fall back to any free localhost port if the configured port is busy
-		ln4, err = net.Listen("tcp4", "127.0.0.1:0")
-		if err != nil {
-			return 0, err
-		}
+		return 0, fmt.Errorf("本地同步端口 %d 无法监听（可能被其他程序或旧的 SyncT 实例占用），公网 Cloudflared 源站将返回 502: %w", port, err)
 	}
 	actualPort := ln4.Addr().(*net.TCPAddr).Port
 	listeners := []net.Listener{ln4}
 
-	// Also bind IPv6 loopback `[::1]:<actualPort>` so `https://localhost:18920` works
-	// whether Windows resolves `localhost` to 127.0.0.1 or ::1.
+	// LAN Direct additionally accepts non-loopback peers. Both listeners stay
+	// alive: Windows routes 127.0.0.1 to the specific bind and LAN addresses
+	// to the wildcard one.
+	if allowLAN && port > 0 {
+		if lanLn, lanErr := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", actualPort)); lanErr == nil {
+			listeners = append(listeners, lanLn)
+		} else {
+			s.engine.LogThrottled("lan-bind:"+lanErr.Error(), "WARN", fmt.Sprintf("局域网监听 0.0.0.0:%d 失败（仍可通过本机回环同步）: %v", actualPort, lanErr), time.Minute)
+		}
+	}
+
+	// Also bind IPv6 so `https://localhost:18920` works whether Windows resolves
+	// `localhost` to 127.0.0.1 or ::1. cloudflared logs show it often dials
+	// [::1], so an IPv4-only origin would still answer 502 to the tunnel.
 	if ln6, err6 := net.Listen("tcp6", fmt.Sprintf("[::1]:%d", actualPort)); err6 == nil {
 		listeners = append(listeners, ln6)
+		if allowLAN && port > 0 {
+			if lan6, lanErr := net.Listen("tcp6", fmt.Sprintf("[::]:%d", actualPort)); lanErr == nil {
+				listeners = append(listeners, lan6)
+			}
+		}
+	} else {
+		s.engine.LogThrottled("ipv6-bind:"+err6.Error(), "WARN", fmt.Sprintf("IPv6 监听 [::1]:%d 失败: %v；若 cloudflared 优先访问 ::1 将返回 502", actualPort, err6), time.Minute)
 	}
 
 	tlsCfg, _, tlsErr := EnsureLocalTLSConfig()
 	if tlsErr != nil {
 		s.engine.LogThrottled("tls-init:"+tlsErr.Error(), "WARN", fmt.Sprintf("本地 TLS 证书初始化失败，将以 HTTP 回环提供服务: %v", tlsErr), time.Minute)
 	}
+	s.gen++
+	gen := s.gen
 	dualLn := newDualProtocolListener(listeners, tlsCfg, func(err error) {
-		s.engine.LogThrottled("accept:"+err.Error(), "ERROR", fmt.Sprintf("本地同步监听器异常: %v", err), 30*time.Second)
+		if s.stopped.Load() {
+			return
+		}
+		// One stable throttle key: transient accept errors can differ by
+		// client and would otherwise bypass the interval and flood the log.
+		s.engine.LogThrottled("accept-loop", "WARN", fmt.Sprintf("本地同步监听器接收异常（将自动重试）: %v", err), 30*time.Second)
 	})
 	s.listener = dualLn
+	s.port = actualPort
+	s.allowLAN = allowLAN
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.withAuth(s.handleStatus))
@@ -102,24 +154,115 @@ func (s *Server) Start(port int) (int, error) {
 	mux.HandleFunc("/api/file", s.withAuth(s.handleFile))
 	mux.HandleFunc("/api/events", s.withAuth(s.handleEvents))
 
-	s.httpSrv = &http.Server{
+	httpSrv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
+		// Cloudflared's origin TLS errors used to go to a stderr nobody reads
+		// in a windowsgui build. Route them into the visible log; a rejected
+		// self-signed certificate is the direct cause of a public 502.
+		ErrorLog: log.New(engineServerLogger{s.engine}, "", 0),
 	}
+	s.httpSrv = httpSrv
+	s.serving.Store(true)
 
 	go func() {
-		if err := s.httpSrv.Serve(dualLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-			s.engine.LogThrottled("serve:"+err.Error(), "ERROR", fmt.Sprintf("本地同步服务异常退出: %v", err), 30*time.Second)
+		err := httpSrv.Serve(dualLn)
+		if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+			return
 		}
+		if s.stopped.Load() {
+			return
+		}
+		s.engine.LogThrottled("serve-exit", "ERROR", fmt.Sprintf("本地同步服务异常退出: %v；正在自动重建监听", err), 30*time.Second)
+		// Without this the cloudflared ingress keeps answering 502 until the
+		// user restarts the app. Rebind the same port so the tunnel recovers.
+		s.scheduleRestart(gen)
 	}()
 
 	return actualPort, nil
 }
 
+// scheduleRestart rebinds the origin after a listener failed on its own.
+// Only the generation that actually died is restarted, so a delayed failure
+// from a listener that Stop already replaced cannot create a duplicate.
+func (s *Server) scheduleRestart(gen uint64) {
+	s.lifeMu.Lock()
+	if s.gen != gen || s.restartGen == gen {
+		s.lifeMu.Unlock()
+		return
+	}
+	s.restartGen = gen
+	port := s.port
+	s.lifeMu.Unlock()
+
+	go func() {
+		backoff := time.Second
+		for {
+			time.Sleep(backoff)
+			if s.stopped.Load() {
+				return
+			}
+			s.lifeMu.Lock()
+			if s.gen != gen || s.stopped.Load() {
+				s.lifeMu.Unlock()
+				return
+			}
+			s.serving.Store(false)
+			if s.listener != nil {
+				_ = s.listener.Close()
+			}
+			// The Serve goroutine has already returned; close any keep-alive
+			// connections it left behind before binding the replacement.
+			oldSrv := s.httpSrv
+			s.httpSrv = nil
+			if oldSrv != nil {
+				_ = oldSrv.Close()
+			}
+			actual, err := s.startLocked(port, s.allowLAN)
+			s.lifeMu.Unlock()
+			if err == nil {
+				s.engine.LogThrottled("serve-restart", "INFO", fmt.Sprintf("本地同步服务已自动恢复监听 (端口 %d)", actual), 30*time.Second)
+				return
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			s.engine.LogThrottled("serve-restart-fail", "ERROR", fmt.Sprintf("本地同步服务自动重启失败，将重试: %v", err), 30*time.Second)
+		}
+	}()
+}
+
+// Restart rebinds the origin on its current port. The host health loop uses it
+// when the local origin stops answering, which otherwise leaves cloudflared
+// with nothing to forward to and the work PC with a 502.
+func (s *Server) Restart() error {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	if s.stopped.Load() {
+		return errors.New("server stopped")
+	}
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
+	if s.httpSrv != nil {
+		_ = s.httpSrv.Close()
+	}
+	_, err := s.startLocked(s.port, s.allowLAN)
+	return err
+}
+
+// IsServing reports whether the origin currently accepts connections.
+func (s *Server) IsServing() bool {
+	return !s.stopped.Load() && s.serving.Load()
+}
+
 // Stop closes all active SSE streams and shuts down the HTTP listener.
 func (s *Server) Stop() {
+	s.stopped.Store(true)
+	s.serving.Store(false)
+
 	s.subsMu.Lock()
 	for ch, sub := range s.subs {
 		close(sub.events)
@@ -127,12 +270,42 @@ func (s *Server) Stop() {
 	}
 	s.subsMu.Unlock()
 
-	if s.httpSrv != nil {
-		_ = s.httpSrv.Close()
+	s.lifeMu.Lock()
+	httpSrv := s.httpSrv
+	listener := s.listener
+	s.httpSrv = nil
+	s.listener = nil
+	s.gen++
+	s.lifeMu.Unlock()
+
+	if httpSrv != nil {
+		_ = httpSrv.Close()
 	}
-	if s.listener != nil {
-		_ = s.listener.Close()
+	if listener != nil {
+		_ = listener.Close()
 	}
+}
+
+// engineServerLogger forwards net/http server errors into the engine log.
+// TLS handshake failures are how a rejected self-signed certificate becomes
+// visible: cloudflared aborts the origin connection and Cloudflare answers
+// the public hostname with 502.
+type engineServerLogger struct{ engine *Engine }
+
+func (l engineServerLogger) Write(p []byte) (int, error) {
+	line := strings.TrimSpace(string(p))
+	if line != "" {
+		key := "http-server"
+		if strings.Contains(line, "TLS handshake error") {
+			key = "http-tls-handshake"
+			lower := strings.ToLower(line)
+			if strings.Contains(lower, "certificate") || strings.Contains(lower, "unknown authority") {
+				l.engine.noteTLSRejection()
+			}
+		}
+		l.engine.LogThrottled(key, "WARN", line, 5*time.Minute)
+	}
+	return len(p), nil
 }
 
 // ConnectedPeers returns the count of active SSE peer connections.

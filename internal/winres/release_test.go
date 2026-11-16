@@ -53,6 +53,9 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 	hostCfg.LowPrivilegeMode = true
 	hostCfg.AuthToken = sharedToken
 	hostCfg.SyncDir = "./SyncFolder"
+	// The host must be listening whenever the public hostname is opened;
+	// otherwise every first request from the work PC is a 502.
+	hostCfg.AutoStartSync = true
 
 	// Also save to root ./data/config.json for in-place use on this Host machine
 	_ = os.MkdirAll(filepath.Join(rootDir, "data"), 0o755)
@@ -89,9 +92,15 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 
 ## 2. 本机服务端 (`+"`SyncT-Host-Server`"+`) 使用步骤
 
-1. 本机系统的 `+"`cloudflared`"+` 已在后台运行并将 `+"`synctreei.suosmanthus.cyou`"+` 转发至 `+"`https://localhost:18920`"+`。
-2. 双击运行 `+"`SyncT.exe`"+`（已默认预设为 **主机模式 + 复用系统已运行的 Cloudflared (`+"`System Tunnel`"+`) + `+"`https://synctreei.suosmanthus.cyou`"+` + 端口 `+"`18920`"+`**）。
+1. 本机系统的 `+"`cloudflared`"+` 已在后台运行并将 `+"`synctreei.suosmanthus.cyou`"+` 转发至 `+"`https://localhost:18920`"+`（入站规则需配置 `+"`noTLSVerify: true`"+`，或直接转发到 `+"`http://localhost:18920`"+`）。
+2. 双击运行 `+"`SyncT.exe`"+`（已默认预设为 **主机模式 + 复用系统已运行的 Cloudflared (`+"`System Tunnel`"+`) + `+"`https://synctreei.suosmanthus.cyou`"+` + 端口 `+"`18920`"+`，并已默认开启「自动启动同步」，保证公网入口被访问时本地源站正在监听）。
 3. 选择需要同步的本地文件夹，直接点击右上角 **「启动隧道并同步」** 即可（软件会自动检测并复用系统正在运行的 `+"`cloudflared`"+` 进程，无需填写 Token）。
+
+> **出现 502 Bad Gateway 时**：说明 Cloudflared 隧道在线，但它无法回源到 `+"`https://localhost:18920`"+`。请依次检查：
+> 1. 主机端 SyncT 是否已点击「启动隧道并同步」（状态卡片是否显示「隧道已就绪」与监听端口）；
+> 2. 端口 `+"`18920`"+` 是否被其他程序占用（SyncT 日志会提示，此时不会再静默改用随机端口）；
+> 3. 系统 `+"`cloudflared`"+` 服务的入站规则是否仍指向 `+"`localhost:18920`"+`，自签名证书是否配置了 `+"`noTLSVerify: true`"+`；
+> 4. SyncT 会每 60 秒自动探测公网地址，并在概览页顶部直接给出 502 的具体原因；本地源站异常时会自动重建监听。
 
 ---
 

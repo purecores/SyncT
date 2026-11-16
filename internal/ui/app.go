@@ -145,6 +145,13 @@ func NewApp(cfg config.Config, statePath string) *App {
 // SetWindow binds the native mygo.Window to the App so background goroutines can trigger frames.
 func (app *App) SetWindow(win *mygo.Window) {
 	app.win = win
+	// Refresh the portable exe path in the per-user Run entry after the app
+	// was moved to another folder, but never create one the user opted out of.
+	if app.cfg.OpenAtLogin {
+		if err := mygo.App.SetOpenAtLogin(true); err != nil {
+			app.engine.LogLevel("WARN", "更新开机自启登录项失败: "+err.Error())
+		}
+	}
 	if app.cfg.AutoStartSync {
 		app.StartAll()
 	}
@@ -196,6 +203,12 @@ func (app *App) StartAll() error {
 		if err := app.tunnel.Start(app.cfg, stats.LocalPort); err != nil {
 			app.engine.LogLevel("WARN", err.Error())
 		}
+		// Reuse the system cloudflared only if it is actually running; when the
+		// service is stopped the public hostname answers 502 and the user needs
+		// to know that it is the tunnel, not SyncT, that must be started.
+		if app.cfg.TunnelMode == config.TunnelSystem && !tunnel.DetectSystemCloudflared().Running {
+			app.engine.LogLevel("WARN", fmt.Sprintf("未检测到运行中的系统 cloudflared 服务：公网地址 %s 将返回 502，请先启动 cloudflared 服务/进程后重新连接", app.cfg.CustomPublicURL))
+		}
 	}
 	app.updateKeepAwake(true)
 	return nil
@@ -206,6 +219,22 @@ func (app *App) StopAll() {
 	app.tunnel.Stop()
 	app.engine.Stop()
 	app.updateKeepAwake(false)
+}
+
+// fixTunnelTLS installs the portable origin certificate into the Windows
+// trusted root store (with a UAC prompt) and restarts cloudflared, so its
+// origin connection stops failing with "certificate signed by unknown
+// authority" — the cause of the public 502.
+func (app *App) fixTunnelTLS() {
+	if err := syncer.InstallLocalTrust(); err != nil {
+		app.engine.LogLevel("ERROR", "修复 502 失败: "+err.Error())
+		app.pendingToast = "修复 502 失败: " + err.Error()
+		app.requestRedraw()
+		return
+	}
+	app.engine.Logf("已请求安装本地证书并重启 cloudflared；约 10 秒后会自动复检公网入口")
+	app.pendingToast = "已提交证书信任修复，公网入口将在 cloudflared 重启后恢复"
+	app.requestRedraw()
 }
 
 func (app *App) updateKeepAwake(running bool) {
@@ -362,6 +391,13 @@ func (app *App) buildToolbar(c *ui.Context, t *ui.Theme) {
 				c.Toast("已触发文件夹增量扫描与对账")
 			}
 
+			if app.cfg.Role == config.RoleHost && stats.TLSRejected {
+				if ui.Button(c.Key("btn-fix-502"), "修复 502 (信任本地证书)").Clicked() {
+					go app.fixTunnelTLS()
+					c.Toast("正在请求管理员权限安装本地证书并重启 cloudflared…")
+				}
+			}
+
 			if ui.Button(c.Key("btn-open-dir"), "打开同步目录").Clicked() {
 				if app.win != nil {
 					go mygo.Shell.OpenPath(app.cfg.SyncDir)
@@ -506,8 +542,11 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 			})
 
 			// Error banner if any
-			if stats.LastError != "" || stats.LastScanError != "" || tunErr != "" {
+			if stats.LastError != "" || stats.HealthWarning != "" || stats.LastScanError != "" || tunErr != "" {
 				errMsg := stats.LastError
+				if errMsg == "" {
+					errMsg = stats.HealthWarning
+				}
 				if errMsg == "" {
 					errMsg = stats.LastScanError
 				}
@@ -1014,7 +1053,20 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 								app.saveConfig()
 								c.Toast("已保存自动启动同步选项")
 							}
-						}).Description("打开 SyncT.exe 时立即按照上次保存的配置启动隧道与实时同步")
+						}).Description("打开 SyncT.exe 时立即按照上次保存的配置启动隧道与实时同步（主机端默认开启，避免浏览器打开时源站尚未监听而返回 502）")
+
+						ui.Field(c, "开机自动运行", func() {
+							if ui.Switch(c.Key("sw-openatlogin"), &app.cfg.OpenAtLogin).Label("登录 Windows 后自动启动").Changed() {
+								app.saveConfig()
+								if app.win != nil {
+									if err := mygo.App.SetOpenAtLogin(app.cfg.OpenAtLogin); err != nil {
+										c.Toast("设置开机自启失败: " + err.Error())
+									} else {
+										c.Toast("已更新 Windows 登录自启动设置")
+									}
+								}
+							}
+						}).Description("通过当前用户登录项启动（无需管理员权限，可在任务管理器禁用）")
 
 						ui.Field(c, "防止系统休眠", func() {
 							if ui.Switch(c.Key("sw-keepawake"), &app.cfg.KeepAwake).Label("防止系统休眠").Changed() {

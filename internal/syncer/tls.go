@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -44,6 +45,24 @@ func newSyncHTTPTransport() *http.Transport {
 		}
 	}
 	return tr
+}
+
+// InstallLocalTrust installs the local origin certificate into the machine's
+// trusted root store so the cloudflared service accepts it without
+// No TLS Verify. It is invoked from the UI on an explicit user action and
+// shows a UAC prompt; the certificate is generated first if missing.
+func InstallLocalTrust() error {
+	_, certPath, err := EnsureLocalTLSConfig()
+	if err != nil {
+		return err
+	}
+	if certPath == "" {
+		return errors.New("本地证书路径不可用")
+	}
+	if _, err := os.Stat(certPath); err != nil {
+		return fmt.Errorf("读取本地证书失败: %w", err)
+	}
+	return installCACert(certPath)
 }
 
 // EnsureLocalTLSConfig loads or generates a self-signed TLS certificate for
@@ -137,6 +156,16 @@ func (c *peekedConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
+// originFirstByteTimeout bounds how long a fresh origin connection may stay
+// silent before it is dropped. cloudflared and corporate HTTPS proxies can
+// pre-open connections, so a very short deadline would randomly kill the
+// tunnel's request path and surface as intermittent 502s.
+const originFirstByteTimeout = 30 * time.Second
+
+// errOriginListenerFailed ends http.Server.Serve when every accept loop gave
+// up, distinguishing a dead origin from an intentional close.
+var errOriginListenerFailed = errors.New("本地回环监听器已失效")
+
 // dualProtocolListener accepts connections from one or more loopback listeners (IPv4 127.0.0.1 and IPv6 ::1)
 // and transparently serves both HTTPS (TLS 1.2/1.3) and HTTP on the same port by inspecting the first byte.
 type dualProtocolListener struct {
@@ -145,6 +174,8 @@ type dualProtocolListener struct {
 	connCh    chan net.Conn
 	closeOnce sync.Once
 	closedCh  chan struct{}
+	failedCh  chan struct{}
+	failOnce  sync.Once
 	onError   func(error)
 }
 
@@ -154,6 +185,7 @@ func newDualProtocolListener(listeners []net.Listener, tlsConfig *tls.Config, on
 		tlsConfig: tlsConfig,
 		connCh:    make(chan net.Conn, 64),
 		closedCh:  make(chan struct{}),
+		failedCh:  make(chan struct{}),
 		onError:   onError,
 	}
 	for _, ln := range listeners {
@@ -162,7 +194,19 @@ func newDualProtocolListener(listeners []net.Listener, tlsConfig *tls.Config, on
 	return dl
 }
 
+// reportFailure wakes Accept with a permanent error once no accept loop can
+// make progress, so http.Server.Serve returns and the origin is rebound
+// instead of staying silently unreachable behind the tunnel (502).
+func (dl *dualProtocolListener) reportFailure(err error) {
+	if dl.onError != nil {
+		dl.onError(err)
+	}
+	dl.failOnce.Do(func() { close(dl.failedCh) })
+}
+
 func (dl *dualProtocolListener) acceptLoop(ln net.Listener) {
+	var failures int
+	backoff := 5 * time.Millisecond
 	for {
 		rawConn, err := ln.Accept()
 		if err != nil {
@@ -171,19 +215,49 @@ func (dl *dualProtocolListener) acceptLoop(ln net.Listener) {
 				return
 			default:
 			}
-			// A listener that stops accepting without being closed would leave
-			// the sync endpoint silently dead; surface it to the engine log.
-			if dl.onError != nil {
-				dl.onError(fmt.Errorf("监听 %s 的接收循环终止: %w", ln.Addr(), err))
+			// Accept can fail transiently on Windows (e.g. WSAECONNRESET when
+			// a client aborts before the handshake, or a momentary resource
+			// shortage). Returning here used to kill the only listener while
+			// the app still looked healthy; retry instead, and only give up
+			// after sustained failures so Serve can rebind the origin.
+			failures++
+			acceptErr := fmt.Errorf("监听 %s 接收连接失败 (第 %d 次): %w", ln.Addr(), failures, err)
+			if failures >= 10 {
+				// Sustained failure: let Serve return so the origin is rebound.
+				dl.reportFailure(acceptErr)
+				return
 			}
-			return
+			if dl.onError != nil {
+				dl.onError(acceptErr)
+			}
+			select {
+			case <-dl.closedCh:
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < time.Second {
+				backoff *= 2
+			}
+			continue
 		}
-		go dl.dispatchConn(rawConn)
+		failures = 0
+		backoff = 5 * time.Millisecond
+		go func(c net.Conn) {
+			defer func() {
+				if r := recover(); r != nil {
+					_ = c.Close()
+					if dl.onError != nil {
+						dl.onError(fmt.Errorf("连接处理异常: %v", r))
+					}
+				}
+			}()
+			dl.dispatchConn(c)
+		}(rawConn)
 	}
 }
 
 func (dl *dualProtocolListener) dispatchConn(rawConn net.Conn) {
-	_ = rawConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = rawConn.SetReadDeadline(time.Now().Add(originFirstByteTimeout))
 	var b [1]byte
 	n, err := rawConn.Read(b[:])
 	_ = rawConn.SetReadDeadline(time.Time{})
@@ -218,6 +292,8 @@ func (dl *dualProtocolListener) Accept() (net.Conn, error) {
 			return nil, io.EOF
 		}
 		return c, nil
+	case <-dl.failedCh:
+		return nil, errOriginListenerFailed
 	case <-dl.closedCh:
 		return nil, net.ErrClosed
 	}

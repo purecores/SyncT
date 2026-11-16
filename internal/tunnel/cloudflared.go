@@ -261,7 +261,9 @@ func (m *Manager) Start(cfg config.Config, localPort int) error {
 	lanIP := detectLANIP()
 	lanURL := fmt.Sprintf("https://localhost:%d", localPort)
 	if cfg.TunnelMode == config.TunnelDirect && lanIP != "" {
-		lanURL = fmt.Sprintf("https://%s:%d", lanIP, localPort)
+		// LAN peers cannot validate the localhost-only self-signed certificate,
+		// so advertise the HTTP endpoint the dual-protocol origin also serves.
+		lanURL = fmt.Sprintf("http://%s:%d", lanIP, localPort)
 	}
 
 	if cfg.TunnelMode == config.TunnelDirect {
@@ -291,17 +293,24 @@ func (m *Manager) Start(cfg config.Config, localPort int) error {
 		ctx, cancel := context.WithCancel(context.Background())
 		m.mu.Lock()
 		m.cmdCancel = cancel
-		m.state = TunnelRunning
 		m.lanURL = lanURL
 		m.pubURL = pubURL
 		m.lastErr = ""
+		if sysInfo.Running {
+			m.state = TunnelRunning
+		} else {
+			// Do not claim a healthy tunnel when no connector process exists:
+			// the public hostname answers 502 until cloudflared comes back.
+			m.state = TunnelStarting
+			m.lastErr = "未检测到系统 cloudflared 进程，公网入口当前会返回 502"
+		}
 		m.mu.Unlock()
 
 		if sysInfo.Running {
 			m.appendLog(fmt.Sprintf("[系统隧道] 已复用本机正在运行的 Cloudflared (%s)", sysInfo.Summary))
 			m.appendLog(fmt.Sprintf("[映射就绪] %s -> %s (无需重复启动子进程)", pubURL, lanURL))
 		} else {
-			m.appendLog(fmt.Sprintf("[系统隧道] 本地端点 %s 已就绪，绑定公网域名 %s (等待系统 Cloudflared 转发)", lanURL, pubURL))
+			m.appendLog(fmt.Sprintf("[系统隧道] 本地端点 %s 已就绪，但未检测到系统 cloudflared 进程；启动服务前 %s 会返回 502", lanURL, pubURL))
 		}
 		m.notify()
 		if m.onReady != nil {
@@ -358,38 +367,6 @@ func (m *Manager) Start(cfg config.Config, localPort int) error {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, bin, args...)
-	configureCmdPlatform(cmd)
-
-	certPath, _ := config.LocalCertPaths()
-	env := append(os.Environ(), "NO_TLS_VERIFY=true")
-	if _, statErr := os.Stat(certPath); statErr == nil {
-		env = append(env, "TUNNEL_ORIGIN_CA_POOL="+certPath)
-	}
-	cmd.Env = env
-
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return err
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		cancel()
-		return err
-	}
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		m.mu.Lock()
-		m.state = TunnelError
-		m.lastErr = err.Error()
-		m.mu.Unlock()
-		m.appendLog(fmt.Sprintf("[错误] 启动 cloudflared 失败: %v", err))
-		m.notify()
-		return err
-	}
-
 	m.mu.Lock()
 	m.cmdCancel = cancel
 	m.state = TunnelStarting
@@ -400,32 +377,114 @@ func (m *Manager) Start(cfg config.Config, localPort int) error {
 	}
 	m.lastErr = ""
 	m.mu.Unlock()
+	m.notify()
+
+	// Run cloudflared under a supervisor: a crashed connector produces 502 on
+	// the public hostname until someone notices, so restart it with backoff.
+	go m.superviseTunnel(ctx, bin, args, cfg)
+	return nil
+}
+
+// superviseTunnel keeps one managed cloudflared process alive until Stop.
+func (m *Manager) superviseTunnel(ctx context.Context, bin string, args []string, cfg config.Config) {
+	backoff := time.Second
+	started := false
+	for ctx.Err() == nil {
+		if started {
+			if cfg.TunnelMode == config.TunnelQuick {
+				m.mu.Lock()
+				m.pubURL = ""
+				m.mu.Unlock()
+			}
+			m.appendLog(fmt.Sprintf("[重连] %s 后重新启动 Cloudflared 隧道…", backoff.Round(time.Second)))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+		}
+		started = true
+
+		began := time.Now()
+		m.runTunnelProcess(ctx, bin, args, cfg)
+		if ctx.Err() != nil {
+			return
+		}
+		m.mu.Lock()
+		if m.lastErr == "" {
+			m.lastErr = "cloudflared 进程已意外结束，正在自动重启"
+		}
+		m.state = TunnelError
+		m.mu.Unlock()
+		m.appendLog("[退出] Cloudflared 隧道进程已退出，将自动重启")
+		m.notify()
+
+		// A process that ran for a while is not crash-looping; retry promptly.
+		if time.Since(began) > time.Minute {
+			backoff = time.Second
+		} else if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// runTunnelProcess starts one cloudflared process and blocks until it exits.
+func (m *Manager) runTunnelProcess(ctx context.Context, bin string, args []string, cfg config.Config) {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	configureCmdPlatform(cmd)
+
+	certPath, _ := config.LocalCertPaths()
+	env := append(os.Environ(), "NO_TLS_VERIFY=true")
+	if _, statErr := os.Stat(certPath); statErr == nil {
+		// cloudflared expects a directory of PEM files here, not a single file.
+		env = append(env, "TUNNEL_ORIGIN_CA_POOL="+filepath.Dir(certPath))
+	}
+	cmd.Env = env
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		m.appendLog(fmt.Sprintf("[错误] 无法读取 cloudflared 输出: %v", err))
+		return
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		m.appendLog(fmt.Sprintf("[错误] 无法读取 cloudflared 错误输出: %v", err))
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		m.mu.Lock()
+		m.state = TunnelError
+		m.lastErr = fmt.Sprintf("启动 cloudflared 失败: %v", err)
+		m.mu.Unlock()
+		m.appendLog(fmt.Sprintf("[错误] 启动 cloudflared 失败: %v", err))
+		m.notify()
+		return
+	}
+
+	m.mu.Lock()
+	if ctx.Err() == nil {
+		m.state = TunnelStarting
+		m.lastErr = ""
+	}
+	m.mu.Unlock()
 	m.appendLog(fmt.Sprintf("[启动] %s %s", filepath.Base(bin), strings.Join(maskTokenArgs(args), " ")))
 	m.notify()
 
 	go m.scanPipe(ctx, stdoutPipe, cfg)
 	go m.scanPipe(ctx, stderrPipe, cfg)
 
-	go func() {
-		waitErr := cmd.Wait()
-		if ctx.Err() != nil {
-			return
-		}
-		m.mu.Lock()
-		if m.state != TunnelStopped {
-			m.state = TunnelError
-			if waitErr != nil {
-				m.lastErr = fmt.Sprintf("cloudflared 进程退出: %v", waitErr)
-			} else {
-				m.lastErr = "cloudflared 进程已意外结束"
-			}
-		}
-		m.mu.Unlock()
-		m.appendLog("[退出] Cloudflared 隧道进程已停止")
-		m.notify()
-	}()
-
-	return nil
+	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		return
+	}
+	m.mu.Lock()
+	if waitErr != nil {
+		m.lastErr = fmt.Sprintf("cloudflared 进程退出: %v", waitErr)
+	} else {
+		m.lastErr = "cloudflared 进程已意外结束"
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) scanPipe(ctx context.Context, r io.Reader, cfg config.Config) {
@@ -445,8 +504,10 @@ func (m *Manager) scanPipe(ctx context.Context, r io.Reader, cfg config.Config) 
 				m.mu.Lock()
 				alreadySet := m.pubURL != ""
 				m.pubURL = match
-				m.state = TunnelRunning
-				m.lastErr = ""
+				if m.state != TunnelStopped {
+					m.state = TunnelRunning
+					m.lastErr = ""
+				}
 				m.mu.Unlock()
 				if !alreadySet {
 					m.appendLog("[就绪] 公网临时隧道已分配: " + match)
@@ -460,7 +521,10 @@ func (m *Manager) scanPipe(ctx context.Context, r io.Reader, cfg config.Config) 
 			if strings.Contains(line, "Registered tunnel connection") || strings.Contains(line, "Updated to new configuration") {
 				m.mu.Lock()
 				wasRunning := m.state == TunnelRunning
-				m.state = TunnelRunning
+				if m.state != TunnelStopped {
+					m.state = TunnelRunning
+					m.lastErr = ""
+				}
 				if m.pubURL == "" && strings.TrimSpace(cfg.CustomPublicURL) != "" {
 					m.pubURL = config.NormalizeRemoteURL(cfg.CustomPublicURL)
 				}
@@ -493,10 +557,24 @@ func (m *Manager) monitorSystemProcess(ctx context.Context, pubURL, lanURL strin
 			info := m.SystemStatus()
 			if info.Running && !wasRunning {
 				wasRunning = true
+				m.mu.Lock()
+				if m.state != TunnelStopped {
+					m.state = TunnelRunning
+					m.lastErr = ""
+				}
+				m.mu.Unlock()
 				m.appendLog(fmt.Sprintf("[系统隧道] 检测到系统 Cloudflared 已恢复运行 (%s) · %s -> %s", info.Summary, pubURL, lanURL))
+				m.notify()
 			} else if !info.Running && wasRunning {
 				wasRunning = false
-				m.appendLog("[提示] 系统 Cloudflared 进程暂未运行，本地 https://localhost:18920 仍保持监听")
+				m.mu.Lock()
+				if m.state != TunnelStopped {
+					m.state = TunnelStarting
+					m.lastErr = "系统 cloudflared 进程已退出，公网入口将返回 502"
+				}
+				m.mu.Unlock()
+				m.appendLog(fmt.Sprintf("[提示] 系统 Cloudflared 进程已退出：公网 %s 将返回 502 (本地 %s 仍保持监听)", pubURL, lanURL))
+				m.notify()
 			}
 		}
 	}

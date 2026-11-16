@@ -34,8 +34,11 @@ func TestNormalizeDefaults(t *testing.T) {
 	if c.SyncDirection != SyncBidirectional || c.ConflictPolicy != ConflictKeepBoth {
 		t.Fatalf("sync defaults = %s/%s", c.SyncDirection, c.ConflictPolicy)
 	}
-	if d := Default(); !d.SyncDeletions || d.AutoStartSync {
+	if d := Default(); !d.SyncDeletions || !d.AutoStartSync {
 		t.Fatalf("Default() deletion/autostart = %v/%v", d.SyncDeletions, d.AutoStartSync)
+	}
+	if d := Default(); d.OpenAtLogin {
+		t.Fatal("Default() must not register a login item without the user opting in")
 	}
 	if len(c.IgnorePatterns) == 0 {
 		t.Fatal("ignore patterns should default")

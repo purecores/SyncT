@@ -122,6 +122,7 @@ type Config struct {
 	ConflictPolicy   ConflictPolicy  `json:"conflict_policy"`
 	SyncDeletions    bool            `json:"sync_deletions"`
 	AutoStartSync    bool            `json:"auto_start_sync"`
+	OpenAtLogin      bool            `json:"open_at_login"`
 	KeepAwake        bool            `json:"keep_awake"`
 	MinimizeToTray   bool            `json:"minimize_to_tray"`
 	CloudflaredPath  string          `json:"cloudflared_path"`
@@ -252,7 +253,8 @@ func Default() Config {
 		SyncDirection:    SyncBidirectional,
 		ConflictPolicy:   ConflictKeepBoth,
 		SyncDeletions:    true,
-		AutoStartSync:    false,
+		AutoStartSync:    true,
+		OpenAtLogin:      false,
 		KeepAwake:        true,
 		MinimizeToTray:   true,
 		IgnorePatterns:   DefaultIgnorePatterns(),
