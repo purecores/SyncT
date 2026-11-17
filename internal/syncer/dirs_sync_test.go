@@ -158,45 +158,6 @@ func TestUnsyncedCountAndPendingStatus(t *testing.T) {
 	}
 }
 
-func TestHashCacheServesPrefetchedDigest(t *testing.T) {
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, "f.txt")
-	mustWriteFile(t, path, []byte("prefetch me"))
-	want, err := HashFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	size, mtime := info.Size(), info.ModTime().UTC().UnixMilli()
-
-	cache := newFileHashCache()
-	// Simulate the scan's own read, then a prefetch for the next scan.
-	if _, ok := cache.take("f.txt", size, mtime); ok {
-		t.Fatal("cache should start empty")
-	}
-	cache.prefetch([]hashJob{{rel: "f.txt", fullPath: path, size: size, mtime: mtime, hash: want}})
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if got, ok := cache.take("f.txt", size, mtime); ok {
-			if got != want {
-				t.Fatalf("cached hash = %q; want %q", got, want)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("prefetch never became available")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	// A changed size is never served from the cache.
-	if _, ok := cache.take("f.txt", size+1, mtime); ok {
-		t.Fatal("cache served a digest for a different size")
-	}
-}
-
 func TestManifestCarriesDirsRoundTrip(t *testing.T) {
 	m := NewManifest("n1")
 	m.Dirs["@work/docs"] = DirMeta{FolderID: "work", RelPath: "@work/docs"}
@@ -250,4 +211,15 @@ func TestEmptyFolderRealtimePropagation(t *testing.T) {
 		info, err := os.Stat(filepath.Join(hostDir, "FromClient", "Empty"))
 		return err == nil && info.IsDir()
 	})
+}
+
+func TestParallelScanHashesCoversEveryIndex(t *testing.T) {
+	const n = 257
+	hits := make([]int, n)
+	parallelScanHashes(n, func(i int) { hits[i]++ })
+	for i, h := range hits {
+		if h != 1 {
+			t.Fatalf("index %d ran %d times; want exactly once", i, h)
+		}
+	}
 }

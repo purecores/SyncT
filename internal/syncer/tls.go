@@ -47,11 +47,16 @@ func newSyncHTTPTransport() *http.Transport {
 	// Transfers are bulk bytes over one tunnel; a handful of reused
 	// connections overlap latency between files without opening a new TLS
 	// handshake (and a new Cloudflare edge round trip) per file.
-	if tr.MaxIdleConnsPerHost < 8 {
-		tr.MaxIdleConnsPerHost = 8
+	if tr.MaxIdleConnsPerHost < 64 {
+		tr.MaxIdleConnsPerHost = 64
 	}
-	if tr.MaxIdleConns < 32 {
-		tr.MaxIdleConns = 32
+	if tr.MaxIdleConns < 128 {
+		tr.MaxIdleConns = 128
+	}
+	// Fail fast on a dead tunnel instead of waiting for the kernel's SYN
+	// timeout, which would hold a worker for over 20 seconds per file.
+	if tr.DialContext != nil && tr.TLSHandshakeTimeout == 0 {
+		tr.TLSHandshakeTimeout = 15 * time.Second
 	}
 	tr.DisableCompression = true
 	return tr

@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"synct/internal/config"
@@ -276,10 +277,6 @@ type IndexStore struct {
 	// confirms them. The host serves its files directly, so only a client
 	// that is allowed to push treats new local files as pending.
 	newFilesPending bool
-	// hashCache is created lazily so a zero-value IndexStore (as some callers
-	// still construct in tests) behaves exactly as it did before.
-	hashCache *fileHashCache
-
 	// folderStats and the global totals let Stats() run in O(1) instead of
 	// hashing every tracked file on every UI frame.
 	folderStats map[string]folderStat
@@ -337,7 +334,6 @@ func NewIndexStore(statePath string) *IndexStore {
 		folderStats:   make(map[string]folderStat),
 		folderRoots:   make(map[string]string),
 		pendingWrites: make(map[string]struct{}),
-		hashCache:     newFileHashCache(),
 	}
 	s.load()
 	return s
@@ -742,8 +738,7 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 	seen := make(map[string]FileMeta, 128)
 	changed := make([]FileMeta, 0, 8)
 	seenDirs := make(map[string]DirMeta, 32)
-	cachedHashes := s.hashCache
-	hashJobs := make([]hashJob, 0, 8)
+	var pending []pendingFileHash
 	var skipped int
 	var scanErrs []string
 
@@ -780,34 +775,55 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 			return
 		}
 
-		hash, hashErr := cachedHashes.hashOrCompute(virtualRel, fullPath, size, mtime)
-		if hashErr != nil {
-			// The file may be locked by another program; keep its previous
-			// metadata instead of treating it as deleted.
-			skipped++
-			if hadPrev {
-				seen[virtualRel] = prev
-			}
-			if len(scanErrs) < 5 {
-				scanErrs = append(scanErrs, innerRel)
-			}
-			return
-		}
-		hashJobs = append(hashJobs, hashJob{rel: virtualRel, fullPath: fullPath, size: size, mtime: mtime, hash: hash})
-		meta := FileMeta{
-			FolderID: folder.ID,
-			RelPath:  virtualRel,
-			Size:     size,
-			ModTime:  mtime,
-			SHA256:   hash,
-		}
-		seen[virtualRel] = meta
-		if !hadPrev || prev.SHA256 != hash || prev.Size != size {
-			changed = append(changed, meta)
-		}
+		pending = append(pending, pendingFileHash{
+			fullPath:   fullPath,
+			innerRel:   innerRel,
+			virtualRel: virtualRel,
+			size:       size,
+			mtime:      mtime,
+			prev:       prev,
+			hadPrev:    hadPrev,
+		})
 	})
 	if walkErr != nil {
 		return nil, nil, walkErr
+	}
+
+	// Hash new and changed files concurrently. On Windows each open waits on
+	// the filesystem and any antivirus filter, so hashing a thousand small
+	// files one after another leaves most of the scan time idle. Results keep
+	// the walk order, so logs and uploads stay deterministic.
+	if len(pending) > 0 {
+		outcomes := make([]hashOutcome, len(pending))
+		parallelScanHashes(len(pending), func(i int) {
+			outcomes[i].hash, outcomes[i].err = HashFile(pending[i].fullPath)
+		})
+		for i, job := range pending {
+			outcome := outcomes[i]
+			if outcome.err != nil {
+				// The file may be locked by another program; keep its previous
+				// metadata instead of treating it as deleted.
+				skipped++
+				if job.hadPrev {
+					seen[job.virtualRel] = job.prev
+				}
+				if len(scanErrs) < 5 {
+					scanErrs = append(scanErrs, job.innerRel)
+				}
+				continue
+			}
+			meta := FileMeta{
+				FolderID: folder.ID,
+				RelPath:  job.virtualRel,
+				Size:     job.size,
+				ModTime:  job.mtime,
+				SHA256:   outcome.hash,
+			}
+			seen[job.virtualRel] = meta
+			if !job.hadPrev || job.prev.SHA256 != outcome.hash || job.prev.Size != job.size {
+				changed = append(changed, meta)
+			}
+		}
 	}
 	if len(unreadableDirs) > 0 {
 		skipped += len(unreadableDirs)
@@ -929,11 +945,6 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 	s.generation++
 	s.mu.Unlock()
 
-	// Prepare digests for the files that just changed so the next scan stays a
-	// metadata walk, and let the transfers reuse them.
-	s.hashCache.retain(hashJobs)
-	s.hashCache.prefetch(hashJobs)
-
 	if skipped > 0 {
 		detail := fmt.Sprintf("%d 个文件或目录暂时无法读取", skipped)
 		if len(scanErrs) > 0 {
@@ -942,6 +953,56 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 		return changed, deleted, errors.New(detail)
 	}
 	return changed, deleted, nil
+}
+
+type pendingFileHash struct {
+	fullPath   string
+	innerRel   string
+	virtualRel string
+	size       int64
+	mtime      int64
+	prev       FileMeta
+	hadPrev    bool
+}
+
+type hashOutcome struct {
+	hash string
+	err  error
+}
+
+// parallelScanHashes runs fn for every index with a small worker pool. It is
+// separate from parallelDo because scans must not be bounded by the transfer
+// worker count.
+func parallelScanHashes(n int, fn func(int)) {
+	if n <= 0 {
+		return
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 2 && n > 1 {
+		workers = 2
+	}
+	if workers > n {
+		workers = n
+	}
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				idx := int(next.Add(1)) - 1
+				if idx >= n {
+					return
+				}
+				fn(idx)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // walkFolderTree enumerates regular files under root using os.ReadDir, which
@@ -1193,7 +1254,7 @@ func HashFile(fullPath string) (string, error) {
 
 // ioBufferPool keeps transfer/hash buffers bounded and reused.
 var ioBufferPool = sync.Pool{New: func() any {
-	b := make([]byte, 64*1024)
+	b := make([]byte, 256*1024)
 	return &b
 }}
 
