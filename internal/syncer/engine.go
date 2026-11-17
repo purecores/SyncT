@@ -78,6 +78,8 @@ type Stats struct {
 	RemoteNodeID    string
 	FolderCount     int
 	TotalFiles      int
+	UnsyncedFiles   int
+	TotalDirs       int
 	TotalBytes      int64
 	BytesUploaded   int64
 	BytesDownloaded int64
@@ -122,10 +124,11 @@ type Engine struct {
 
 	bytesUploaded   atomic.Int64
 	bytesDownloaded atomic.Int64
-	uploadSpeed     atomic.Int64
-	downloadSpeed   atomic.Int64
+	uploadMeter     rateMeter
+	downloadMeter   rateMeter
 	lastUploadAt    atomic.Int64
 	lastDownloadAt  atomic.Int64
+	lastNotifyAt    atomic.Int64
 	syncedEvents    atomic.Int64
 	conflictsSaved  atomic.Int64
 	scanErrors      atomic.Int64
@@ -193,6 +196,7 @@ func NewEngine(cfg config.Config, statePath string, onUpdate func()) *Engine {
 		e.LogThrottled("state-save:"+err.Error(), "WARN", fmt.Sprintf("持久化状态索引失败: %v", err), 30*time.Second)
 	})
 	e.server = NewServer(e)
+	e.index.SetNewFilesPending(cfg.Role == config.RoleClient && cfg.SyncDirection != config.SyncPullOnly)
 
 	if loadErr := e.index.LoadError(); loadErr != nil {
 		e.LogLevel("WARN", loadErr.Error())
@@ -246,6 +250,7 @@ func (e *Engine) UpdateConfig(cfg config.Config) {
 	ignoreChanged := !sameStrings(e.cfg.IgnorePatterns, cfg.IgnorePatterns)
 	e.cfg = cfg
 	e.mu.Unlock()
+	e.index.SetNewFilesPending(cfg.Role == config.RoleClient && cfg.SyncDirection != config.SyncPullOnly)
 
 	if foldersChanged || ignoreChanged {
 		e.signalWatchers()
@@ -414,6 +419,13 @@ func (e *Engine) Start() error {
 	e.lastScanError = ""
 	e.mu.Unlock()
 	e.notifyUI()
+
+	// A short frame cadence keeps the live rate smooth while a transfer runs
+	// and lets it decay visibly afterwards; event-driven redraws alone would
+	// leave the last number on screen until the next file finished.
+	if e.onUpdate != nil {
+		go e.telemetryLoop(ctx)
+	}
 
 	folders := cfg.EnabledFolders()
 	for _, f := range folders {
@@ -886,20 +898,24 @@ func (e *Engine) runLocalScan(ctx context.Context, pending map[string]struct{}, 
 		e.setScanSuccess()
 	}
 
-	if len(changed) == 0 && len(deleted) == 0 {
+	addedDirs := e.index.TakeAddedDirs()
+	if len(changed) == 0 && len(deleted) == 0 && len(addedDirs) == 0 {
 		if elapsed := time.Since(started); elapsed > 2*time.Second {
 			e.Logf("目录扫描完成，无变更 (耗时 %s，来源: %s)", elapsed.Round(time.Millisecond), reason)
 		}
 		return
 	}
 
-	totalEvents := len(changed) + len(deleted)
+	totalEvents := len(changed) + len(deleted) + len(addedDirs)
 	if totalEvents > 20 {
-		e.LogLevel("SYNC", fmt.Sprintf("目录扫描完成: %d 项新增/更新，%d 项删除 (来源: %s)", len(changed), len(deleted), reason))
+		e.LogLevel("SYNC", fmt.Sprintf("目录扫描完成: %d 项新增/更新，%d 项删除，%d 个新文件夹 (来源: %s)", len(changed), len(deleted), len(addedDirs), reason))
 	} else {
 		for i := range changed {
 			f := changed[i]
 			e.LogLevel("SYNC", fmt.Sprintf("检测到本地文件更新: %s (%s)", f.RelPath, FormatBytes(f.Size)))
+		}
+		for i := range addedDirs {
+			e.LogLevel("SYNC", fmt.Sprintf("检测到新文件夹: %s", addedDirs[i].RelPath))
 		}
 	}
 
@@ -910,6 +926,14 @@ func (e *Engine) runLocalScan(ctx context.Context, pending map[string]struct{}, 
 				Type:       EventUpsert,
 				OriginNode: e.index.NodeID(),
 				File:       &f,
+			})
+		}
+		for i := range addedDirs {
+			d := addedDirs[i]
+			e.server.Broadcast(SyncEvent{
+				Type:       EventDir,
+				OriginNode: e.index.NodeID(),
+				Dir:        &d,
 			})
 		}
 		if cfg.SyncDeletions {
@@ -931,14 +955,16 @@ func (e *Engine) runLocalScan(ctx context.Context, pending map[string]struct{}, 
 		if ctx.Err() == nil {
 			e.reconcileMu.Lock()
 			if cfg.SyncDirection != config.SyncPullOnly {
-				for _, f := range changed {
-					if ctx.Err() != nil {
-						break
+				if len(addedDirs) > 0 {
+					if err := e.pushDirsToRemote(ctx, cfg, addedDirs); err != nil {
+						e.LogThrottled("dir-push:"+err.Error(), "WARN", fmt.Sprintf("同步空文件夹失败: %v", err), 30*time.Second)
 					}
+				}
+				parallelDo(ctx, changed, func(f FileMeta) {
 					if err := e.pushFileToRemote(ctx, cfg, f, ""); err != nil {
 						e.LogThrottled("push:"+f.RelPath+":"+err.Error(), "WARN", fmt.Sprintf("上传 %s 失败: %v", f.RelPath, err), 30*time.Second)
 					}
-				}
+				})
 				if cfg.SyncDeletions {
 					for _, t := range deleted {
 						if ctx.Err() != nil {
@@ -1101,6 +1127,29 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 	canPush := cfg.SyncDirection == config.SyncBidirectional || cfg.SyncDirection == config.SyncPushOnly
 	matcher := newIgnoreMatcher(cfg.IgnorePatterns)
 
+	// Empty folders have no files to carry them across, so the manifest lists
+	// directories separately. Pulling them first means a peer's file writes
+	// land in a folder that already exists with the right name and casing.
+	if canPull {
+		e.ensureRemoteDirs(cfg, remoteManifest.Dirs)
+	}
+
+	// Gather the work first, then run independent file transfers concurrently.
+	// A tunnel carries many requests over one HTTP/2 connection, so sequential
+	// one-file-at-a-time sync leaves most of the link idle on small trees.
+	type pullTask struct {
+		rel      string
+		rem      FileMeta
+		conflict bool
+	}
+	type pushTask struct {
+		rel      string
+		loc      FileMeta
+		baseHash string
+	}
+	var pulls []pullTask
+	var pushes []pushTask
+
 	// 1. Handle files present on Remote
 	for rel, remFile := range remoteManifest.Files {
 		if ctx.Err() != nil {
@@ -1123,9 +1172,7 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 				continue
 			}
 			if canPull {
-				if err := e.pullFileFromRemote(ctx, cfg, remFile, false); err != nil {
-					e.LogThrottled("pull:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("下载文件 %s 失败: %v", rel, err), 30*time.Second)
-				}
+				pulls = append(pulls, pullTask{rel: rel, rem: remFile})
 			}
 			continue
 		}
@@ -1136,26 +1183,16 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 			continue
 		}
 
-		// Hashes differ! Decide direction based on SyncDirection and ModTime
-		if cfg.SyncDirection == config.SyncPullOnly {
-			if err := e.pullFileFromRemote(ctx, cfg, remFile, cfg.ConflictPolicy == config.ConflictKeepBoth); err != nil {
-				e.LogThrottled("pull:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("下载文件 %s 失败: %v", rel, err), 30*time.Second)
-			}
-		} else if cfg.SyncDirection == config.SyncPushOnly {
-			if err := e.pushFileToRemote(ctx, cfg, locFile, remFile.SHA256); err != nil {
-				e.LogThrottled("push:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("上传文件 %s 失败: %v", rel, err), 30*time.Second)
-			}
-		} else {
-			// Bidirectional: compare ModTime
-			if remFile.ModTime >= locFile.ModTime {
-				if err := e.pullFileFromRemote(ctx, cfg, remFile, cfg.ConflictPolicy == config.ConflictKeepBoth); err != nil {
-					e.LogThrottled("pull:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("下载文件 %s 失败: %v", rel, err), 30*time.Second)
-				}
-			} else {
-				if err := e.pushFileToRemote(ctx, cfg, locFile, remFile.SHA256); err != nil {
-					e.LogThrottled("push:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("上传文件 %s 失败: %v", rel, err), 30*time.Second)
-				}
-			}
+		// Hashes differ! Decide direction based on SyncDirection and ModTime.
+		switch {
+		case cfg.SyncDirection == config.SyncPullOnly:
+			pulls = append(pulls, pullTask{rel: rel, rem: remFile, conflict: cfg.ConflictPolicy == config.ConflictKeepBoth})
+		case cfg.SyncDirection == config.SyncPushOnly:
+			pushes = append(pushes, pushTask{rel: rel, loc: locFile, baseHash: remFile.SHA256})
+		case remFile.ModTime >= locFile.ModTime:
+			pulls = append(pulls, pullTask{rel: rel, rem: remFile, conflict: cfg.ConflictPolicy == config.ConflictKeepBoth})
+		default:
+			pushes = append(pushes, pushTask{rel: rel, loc: locFile, baseHash: remFile.SHA256})
 		}
 	}
 
@@ -1180,15 +1217,174 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 			continue
 		}
 		if canPush {
-			if err := e.pushFileToRemote(ctx, cfg, locFile, ""); err != nil {
-				e.LogThrottled("push:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("上传文件 %s 失败: %v", rel, err), 30*time.Second)
-			}
+			pushes = append(pushes, pushTask{rel: rel, loc: locFile})
 		}
 	}
+
+	parallelDo(ctx, pulls, func(t pullTask) {
+		if err := e.pullFileFromRemote(ctx, cfg, t.rem, t.conflict); err != nil {
+			e.LogThrottled("pull:"+t.rel+":"+err.Error(), "WARN", fmt.Sprintf("下载文件 %s 失败: %v", t.rel, err), 30*time.Second)
+		}
+	})
+	parallelDo(ctx, pushes, func(t pushTask) {
+		if err := e.pushFileToRemote(ctx, cfg, t.loc, t.baseHash); err != nil {
+			e.LogThrottled("push:"+t.rel+":"+err.Error(), "WARN", fmt.Sprintf("上传文件 %s 失败: %v", t.rel, err), 30*time.Second)
+		}
+	})
 
 	e.index.RequestSave()
 	e.notifyUI()
 	return nil
+}
+
+// maxParallelTransfers bounds how many files move at once. Cloudflare tunnels
+// multiplex requests, so a handful of transfers overlap latency instead of
+// adding round trips in sequence; more than that competes for one small uplink
+// without making the batch finish sooner.
+const maxParallelTransfers = 4
+
+// parallelDo runs fn over items with a bounded worker pool and returns when
+// every item finished. The caller holds reconcileMu and owns ctx.
+func parallelDo[T any](ctx context.Context, items []T, fn func(T)) {
+	if len(items) == 0 {
+		return
+	}
+	if len(items) == 1 || maxParallelTransfers <= 1 {
+		for _, item := range items {
+			if ctx.Err() != nil {
+				return
+			}
+			fn(item)
+		}
+		return
+	}
+	workers := min(maxParallelTransfers, len(items))
+	jobs := make(chan T)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for item := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				fn(item)
+			}
+		}()
+	}
+	for _, item := range items {
+		if ctx.Err() != nil {
+			break
+		}
+		jobs <- item
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+// ApplyPeerDirs creates the directories another node reports and records them.
+// origin is ignored for duplicate filtering: a repeated creation is a no-op
+// because the directory already exists.
+func (e *Engine) ApplyPeerDirs(dirs []DirMeta, _ string) int {
+	if len(dirs) == 0 {
+		return 0
+	}
+	cfg := e.Config()
+	if cfg.SyncDirection == config.SyncPushOnly {
+		return 0
+	}
+	before := e.index.DirCount()
+	byRel := make(map[string]DirMeta, len(dirs))
+	for _, d := range dirs {
+		if d.RelPath != "" {
+			byRel[d.RelPath] = d
+		}
+	}
+	e.ensureRemoteDirs(cfg, byRel)
+	created := e.index.DirCount() - before
+	if created > 0 {
+		e.index.RequestSave()
+		e.notifyUI()
+	}
+	return created
+}
+
+// pushDirsToRemote tells the peer about folders created here. The host also
+// sees them through the periodic manifest exchange, but this arrives while the
+// user is still looking at the folder they just made.
+func (e *Engine) pushDirsToRemote(ctx context.Context, cfg config.Config, dirs []DirMeta) error {
+	if len(dirs) == 0 {
+		return nil
+	}
+	baseURL := config.NormalizeRemoteURL(cfg.RemoteURL)
+	if baseURL == "" {
+		return errors.New("远端地址为空")
+	}
+	payload, err := json.Marshal(struct {
+		OriginNode string    `json:"origin_node"`
+		Dirs       []DirMeta `json:"dirs"`
+	}{OriginNode: e.index.NodeID(), Dirs: dirs})
+	if err != nil {
+		return err
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+"/api/dirs", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("X-SyncT-Token", cfg.AuthToken)
+	req.Header.Set("X-SyncT-Node", e.index.NodeID())
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ensureRemoteDirs creates the directories the peer reports. A path that no
+// enabled mapping owns, or one the ignore rules cover, is skipped: an empty
+// folder must never be created outside the folders the user chose to sync.
+func (e *Engine) ensureRemoteDirs(cfg config.Config, dirs map[string]DirMeta) {
+	created := 0
+	matcher := newIgnoreMatcher(cfg.IgnorePatterns)
+	for rel := range dirs {
+		cleanRel, ok := CleanRelPath(rel)
+		if !ok {
+			continue
+		}
+		if matcher.MatchVirtual(cleanRel, true) {
+			continue
+		}
+		folder, inner, fullPath, ok := ResolveFolderFullPath(cfg, cleanRel)
+		if !ok || inner == "" {
+			continue
+		}
+		if info, statErr := os.Stat(fullPath); statErr == nil {
+			if info.IsDir() {
+				continue
+			}
+			// A file occupies the path; writing through it would fail anyway.
+			e.LogThrottled("dir-conflict:"+rel, "WARN", fmt.Sprintf("远端文件夹与本地同名文件冲突，已跳过: %s", rel), time.Minute)
+			continue
+		}
+		if err := os.MkdirAll(fullPath, 0o755); err != nil {
+			e.LogThrottled("dir-mkdir:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("创建远端空文件夹失败 (%s): %v", rel, err), 30*time.Second)
+			continue
+		}
+		e.index.AddDir(DirMeta{FolderID: folder.ID, RelPath: cleanRel})
+		created++
+	}
+	if created > 0 {
+		e.markSyncedActivity(fmt.Sprintf("已创建远端空文件夹: %d 个", created))
+	}
 }
 
 // listenRemoteEvents reads the Host's SSE stream and queues events for
@@ -1266,6 +1462,14 @@ func (e *Engine) listenRemoteEvents(ctx context.Context) error {
 		return fmt.Errorf("SSE 连接空闲超时 (%s)", sseIdleTimeout)
 	}
 	return errors.New("SSE 连接已断开")
+}
+
+// isPullOrBidirectional reports whether this node accepts an originating
+// node's directories. A push-only node never writes to its folders.
+func (e *Engine) isPullOrBidirectional() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.cfg.SyncDirection != config.SyncPushOnly
 }
 
 // isPushOnly reads the direction without cloning the whole config (called per SSE line).
@@ -1350,6 +1554,8 @@ func mergeRemoteEvent(pending map[string]SyncEvent, ev SyncEvent) {
 		rel = ev.File.RelPath
 	case ev.Tombstone != nil:
 		rel = ev.Tombstone.RelPath
+	case ev.Dir != nil:
+		rel = ev.Dir.RelPath
 	default:
 		return
 	}
@@ -1414,6 +1620,12 @@ func (e *Engine) processRemoteEventsLocked(ctx context.Context, pending map[stri
 				continue
 			}
 			applied++
+		case EventDir:
+			if ev.Dir == nil || ev.Dir.RelPath == "" || matcher.MatchVirtual(ev.Dir.RelPath, true) {
+				continue
+			}
+			e.ensureRemoteDirs(cfg, map[string]DirMeta{ev.Dir.RelPath: *ev.Dir})
+			applied++
 		case EventDelete:
 			if ev.Tombstone == nil || !cfg.SyncDeletions || matcher.MatchVirtual(ev.Tombstone.RelPath, false) {
 				continue
@@ -1467,10 +1679,15 @@ func remoteStatusError(action string, status int, body string) error {
 }
 
 func (e *Engine) fetchRemoteManifest(ctx context.Context, baseURL, token string, localFolders []config.FolderMapping) (Manifest, error) {
+	pushDirs := e.isPullOrBidirectional()
 	payload, err := json.Marshal(struct {
-		Folders []config.FolderMapping `json:"folders"`
+		Folders  []config.FolderMapping `json:"folders"`
+		Dirs     []DirMeta              `json:"dirs,omitempty"`
+		PushDirs bool                   `json:"push_dirs,omitempty"`
 	}{
-		Folders: localFolders,
+		Folders:  localFolders,
+		Dirs:     e.index.DirsList(),
+		PushDirs: pushDirs,
 	})
 	if err != nil {
 		return Manifest{}, fmt.Errorf("编码目录映射失败: %w", err)
@@ -1505,6 +1722,9 @@ func (e *Engine) fetchRemoteManifest(ctx context.Context, baseURL, token string,
 	}
 	if m.Files == nil {
 		m.Files = make(map[string]FileMeta)
+	}
+	if m.Dirs == nil {
+		m.Dirs = make(map[string]DirMeta)
 	}
 	if m.Tombstones == nil {
 		m.Tombstones = make(map[string]Tombstone)
@@ -1585,7 +1805,7 @@ func (e *Engine) pullFileFromRemote(ctx context.Context, cfg config.Config, rem 
 
 	hasher := sha256.New()
 	buf := ioBufferPool.Get().(*[]byte)
-	written, copyErr := io.CopyBuffer(io.MultiWriter(tmpFile, hasher), resp.Body, *buf)
+	written, copyErr := io.CopyBuffer(io.MultiWriter(&progressWriter{w: tmpFile, onMove: e.countDownloadBytes}, hasher), resp.Body, *buf)
 	ioBufferPool.Put(buf)
 	closeErr := tmpFile.Close()
 	if copyErr != nil || closeErr != nil {
@@ -1699,7 +1919,14 @@ func (e *Engine) pushFileToRemote(ctx context.Context, cfg config.Config, loc Fi
 	mtime := info.ModTime().UTC().UnixMilli()
 	hash := loc.SHA256
 	// The file may have changed since the last scan (or just be new): refresh
-	// its hash without loading the whole file into memory.
+	// its hash without loading the whole file into memory. A scan prefetch for
+	// the same size and mtime is normally already in flight; give it a moment
+	// before reading the file a second time.
+	if hash == "" || loc.Size != size || abs64(loc.ModTime-mtime) > 2 {
+		if cached, ok := e.index.hashCache.waitForPrefetch(rel, size, mtime, 10*time.Second); ok {
+			hash = cached
+		}
+	}
 	if hash == "" || loc.Size != size || abs64(loc.ModTime-mtime) > 2 {
 		h := sha256.New()
 		buf := ioBufferPool.Get().(*[]byte)
@@ -1735,7 +1962,8 @@ func (e *Engine) pushFileToRemote(ctx context.Context, cfg config.Config, loc Fi
 	)
 	transferCtx, cancel := context.WithTimeout(ctx, transferTimeout(size))
 	defer cancel()
-	req, err := http.NewRequestWithContext(transferCtx, http.MethodPut, u, f)
+	body := &progressReader{r: f, onMove: e.countUploadBytes}
+	req, err := http.NewRequestWithContext(transferCtx, http.MethodPut, u, body)
 	if err != nil {
 		e.index.SetFileStatus(rel, StatusError, "上传失败")
 		return err
@@ -1852,8 +2080,8 @@ func (e *Engine) Stats() Stats {
 		FolderCount:     e.cfg.EnabledFolderCount(),
 		BytesUploaded:   e.bytesUploaded.Load(),
 		BytesDownloaded: e.bytesDownloaded.Load(),
-		UploadSpeed:     e.uploadSpeed.Load(),
-		DownloadSpeed:   e.downloadSpeed.Load(),
+		UploadSpeed:     e.uploadMeter.rate(now),
+		DownloadSpeed:   e.downloadMeter.rate(now),
 		LastSyncFile:    e.lastSyncFile,
 		LastSyncBytes:   e.lastSyncBytes,
 		SyncedEvents:    e.syncedEvents.Load(),
@@ -1867,15 +2095,20 @@ func (e *Engine) Stats() Stats {
 	e.mu.RUnlock()
 
 	// Speeds decay to zero when nothing has moved recently instead of showing
-	// the last burst rate forever.
+	// the last burst rate forever. The meter's own window already excludes the
+	// bytes, so this only needs to stop the UI from polling a stale sample.
 	if last := e.lastUploadAt.Load(); last == 0 || now.Sub(time.Unix(0, last)) > speedIdleWindow {
 		st.UploadSpeed = 0
+		e.uploadMeter.reset()
 	}
 	if last := e.lastDownloadAt.Load(); last == 0 || now.Sub(time.Unix(0, last)) > speedIdleWindow {
 		st.DownloadSpeed = 0
+		e.downloadMeter.reset()
 	}
 
 	st.TotalFiles, st.TotalBytes = e.index.Counts()
+	st.UnsyncedFiles = e.index.UnsyncedCount()
+	st.TotalDirs = e.index.DirCount()
 	return st
 }
 
@@ -2116,19 +2349,39 @@ func (e *Engine) setScanSuccess() {
 	}
 }
 
-func (e *Engine) recordUpload(relPath string, n int64, dur time.Duration) {
+// countUploadBytes feeds the live upload meter as bytes are read from disk.
+// It is called once per streamed buffer, so the rate moves while a large file
+// transfers instead of jumping when the request finishes.
+func (e *Engine) countUploadBytes(n int64) {
+	if n <= 0 {
+		return
+	}
+	sampleRateMeter(&e.uploadMeter, n)
+	e.lastUploadAt.Store(time.Now().UnixNano())
+	e.throttledNotifyUI()
+}
+
+// countDownloadBytes feeds the live download meter as bytes reach disk.
+func (e *Engine) countDownloadBytes(n int64) {
+	if n <= 0 {
+		return
+	}
+	sampleRateMeter(&e.downloadMeter, n)
+	e.lastDownloadAt.Store(time.Now().UnixNano())
+	e.throttledNotifyUI()
+}
+
+// sampleRateMeter records a chunk at the current time. Kept free-standing so
+// the copy loops can call it without allocating a closure per buffer.
+func sampleRateMeter(m *rateMeter, n int64) {
+	m.add(n, time.Now())
+}
+
+func (e *Engine) recordUpload(relPath string, n int64, _ time.Duration) {
 	if n <= 0 {
 		return
 	}
 	e.bytesUploaded.Add(n)
-	if dur <= 0 {
-		dur = time.Millisecond
-	}
-	bps := int64(float64(n) / dur.Seconds())
-	if bps <= 0 {
-		bps = n
-	}
-	e.uploadSpeed.Store(bps)
 	e.lastUploadAt.Store(time.Now().UnixNano())
 	e.mu.Lock()
 	e.lastSyncFile = relPath
@@ -2136,19 +2389,11 @@ func (e *Engine) recordUpload(relPath string, n int64, dur time.Duration) {
 	e.mu.Unlock()
 }
 
-func (e *Engine) recordDownload(relPath string, n int64, dur time.Duration) {
+func (e *Engine) recordDownload(relPath string, n int64, _ time.Duration) {
 	if n <= 0 {
 		return
 	}
 	e.bytesDownloaded.Add(n)
-	if dur <= 0 {
-		dur = time.Millisecond
-	}
-	bps := int64(float64(n) / dur.Seconds())
-	if bps <= 0 {
-		bps = n
-	}
-	e.downloadSpeed.Store(bps)
 	e.lastDownloadAt.Store(time.Now().UnixNano())
 	e.mu.Lock()
 	e.lastSyncFile = relPath
@@ -2171,5 +2416,38 @@ func (e *Engine) markSyncedActivity(msg string) {
 func (e *Engine) notifyUI() {
 	if e.onUpdate != nil {
 		e.onUpdate()
+	}
+}
+
+// telemetryLoop refreshes the dashboard while the engine runs. It is a
+// display clock, not a poller: all measurements are atomic counters read by
+// Stats, so a frame costs no locks beyond the O(1) snapshot.
+func (e *Engine) telemetryLoop(ctx context.Context) {
+	ticker := time.NewTicker(notifyUIInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.notifyUI()
+		}
+	}
+}
+
+// notifyUIInterval bounds how often byte-level progress wakes the UI. Without
+// it every 64 KB buffer would request a frame (~15,000 per gigabyte), and the
+// view is rebuilt whole per frame; four updates a second keep the speed
+// readout live at a negligible cost.
+const notifyUIInterval = 250 * time.Millisecond
+
+func (e *Engine) throttledNotifyUI() {
+	now := time.Now().UnixNano()
+	last := e.lastNotifyAt.Load()
+	if now-last < int64(notifyUIInterval) {
+		return
+	}
+	if e.lastNotifyAt.CompareAndSwap(last, now) {
+		e.notifyUI()
 	}
 }

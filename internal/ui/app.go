@@ -20,28 +20,40 @@ import (
 const (
 	SectionOverview = "overview"
 	SectionFiles    = "files"
+	SectionPending  = "pending"
 	SectionLogs     = "logs"
 	SectionSettings = "settings"
 )
 
+// transferAccent marks downloads. Uploads use the theme accent (indigo, like
+// the app icon's upper face); downloads use the icon's cyan so the two halves
+// of the throughput trace read apart at a glance.
+var transferAccent = ui.Hex("#0891b2")
+
 // Select option labels
 var (
 	tunnelModeOptions = []string{
-		"System Tunnel (复用本机已运行的系统 Cloudflared)",
-		"Token Tunnel (由本软件托管启动 Cloudflared Token 隧道)",
-		"Quick Tunnel (免配置临时公网隧道)",
-		"LAN Direct (仅局域网/本地直连)",
+		"复用系统 Cloudflared (推荐)",
+		"托管 Token 隧道",
+		"临时 Quick Tunnel",
+		"仅局域网直连",
 	}
 	syncDirOptions = []string{
-		"双向实时同步 (本地 <-> 远端)",
-		"仅发送镜像 (本地 -> 远端)",
-		"仅接收镜像 (远端 -> 本地)",
+		"双向实时同步",
+		"仅发送 (本地 -> 远端)",
+		"仅接收 (远端 -> 本地)",
 	}
 	conflictOptions = []string{
-		"保留双方冲突副本 (.conflict)",
-		"最新修改时间覆盖 (Last-Write-Wins)",
+		"保留双方冲突副本",
+		"以最新修改时间为准",
 	}
 )
+
+// speedSample is one point of the throughput trace.
+type speedSample struct {
+	up   int64
+	down int64
+}
 
 // App holds the native MyGo UI state and coordinates the sync engine and Cloudflared tunnel manager.
 type App struct {
@@ -51,14 +63,27 @@ type App struct {
 	win    *mygo.Window
 
 	// Navigation & Layout
-	section      string
-	navOpen      bool
-	toolsOpen    bool
-	roleIndex    int
-	logTab       int
-	portInput    string
-	shareInput   string
-	showToken    bool
+	section    string
+	navOpen    bool
+	toolsOpen  bool
+	roleIndex  int
+	logTab     int
+	portInput  string
+	shareInput string
+	showToken  bool
+
+	// statusBarNoticeSeen mirrors the status bar toggle so a click there is
+	// persisted and confirmed, exactly as the settings page does.
+	statusBarNoticeSeen bool
+
+	// Settings disclosure sections
+	settingsFoldersOpen  bool
+	settingsConnOpen     bool
+	settingsRulesOpen    bool
+	settingsRuntimeOpen  bool
+	settingsAdvancedOpen bool
+	addFolderOpen        bool
+
 	pendingToast string
 
 	// Multi-folder mapping editor inputs
@@ -75,6 +100,11 @@ type App struct {
 	fileSort         ui.SortOrder
 	selectedFileRow  int
 
+	// Unsynced files table state
+	pendingTableState  ui.ListState
+	pendingSort        ui.SortOrder
+	selectedPendingRow int
+
 	// Logs List state
 	syncLogList   ui.ListState
 	tunnelLogList ui.ListState
@@ -90,11 +120,20 @@ type App struct {
 	// rebuilds only when the index generation or a filter actually changes.
 	fileCache fileViewCache
 
+	// Throughput trace: the last minute of sampled rates, kept in the view so
+	// the dashboard stays useful after switching sections.
+	speedHistory []speedSample
+	lastSpeedAt  time.Time
+
 	// binaryRefreshTimer debounces cloudflared --version probes while typing.
 	binaryRefreshTimer *time.Timer
 
 	// Optional hook for directory picker (allows deterministic testing)
 	PickFolderFunc func(current string) (string, error)
+	// OpenPathFunc/RevealPathFunc replace the OS shell in tests.
+	OpenPathFunc     func(path string)
+	RevealPathFunc   func(path string)
+	ClipboardWriteFn func(text string)
 }
 
 type fileViewCache struct {
@@ -112,13 +151,17 @@ type fileViewCache struct {
 func NewApp(cfg config.Config, statePath string) *App {
 	cfg.Normalize()
 	app := &App{
-		cfg:             cfg,
-		section:         SectionOverview,
-		navOpen:         true,
-		toolsOpen:       true,
-		portInput:       strconv.Itoa(cfg.LocalPort),
-		selectedFileRow: -1,
+		cfg:                 cfg,
+		section:             SectionOverview,
+		navOpen:             true,
+		toolsOpen:           true,
+		settingsFoldersOpen: true,
+		settingsConnOpen:    true,
+		portInput:           strconv.Itoa(cfg.LocalPort),
+		selectedFileRow:     -1,
+		selectedPendingRow:  -1,
 	}
+	app.statusBarNoticeSeen = cfg.TrayCloseNotice
 	if cfg.Role == config.RoleClient {
 		app.roleIndex = 1
 	}
@@ -170,6 +213,39 @@ func (app *App) Tunnel() *tunnel.Manager {
 // Config returns the current configuration.
 func (app *App) Config() config.Config {
 	return app.cfg
+}
+
+func (app *App) openPath(path string) {
+	if app.OpenPathFunc != nil {
+		app.OpenPathFunc(path)
+		return
+	}
+	if app.win == nil {
+		return
+	}
+	go mygo.Shell.OpenPath(path)
+}
+
+func (app *App) revealPath(path string) {
+	if app.RevealPathFunc != nil {
+		app.RevealPathFunc(path)
+		return
+	}
+	if app.win == nil {
+		return
+	}
+	go mygo.Shell.ShowItemInFolder(path)
+}
+
+func (app *App) writeClipboard(text string) {
+	if app.ClipboardWriteFn != nil {
+		app.ClipboardWriteFn(text)
+		return
+	}
+	if app.win == nil {
+		return
+	}
+	mygo.Clipboard.WriteText(text)
 }
 
 func (app *App) requestRedraw() {
@@ -262,10 +338,25 @@ func (app *App) syncFieldsToConfig() {
 	app.cfg.Normalize()
 }
 
+// sampleSpeeds appends at most one trace point every half second.
+func (app *App) sampleSpeeds(stats syncer.Stats) {
+	now := time.Now()
+	if !app.lastSpeedAt.IsZero() && now.Sub(app.lastSpeedAt) < 500*time.Millisecond {
+		return
+	}
+	app.lastSpeedAt = now
+	app.speedHistory = append(app.speedHistory, speedSample{up: stats.UploadSpeed, down: stats.DownloadSpeed})
+	if len(app.speedHistory) > 60 {
+		app.speedHistory = append([]speedSample(nil), app.speedHistory[len(app.speedHistory)-60:]...)
+	}
+}
+
 // View builds the entire Windows 11 native interface for each frame.
 func (app *App) View(c *ui.Context) {
-	// Apply Cloudflare-inspired warm orange/amber accent while respecting desktop light/dark mode
-	t := *c.Theme().WithAccent(ui.Hex("#ea580c"))
+	// The app icon is indigo/cyan; using its indigo as the accent keeps the
+	// chrome and the mark in the same family instead of fighting an unrelated
+	// warm accent against it.
+	t := *c.Theme().WithAccent(ui.Hex("#4f46e5"))
 	c.SetTheme(&t)
 	c.SetMenuPresentation(ui.PopoverMenus)
 
@@ -273,6 +364,9 @@ func (app *App) View(c *ui.Context) {
 		c.Toast(app.pendingToast)
 		app.pendingToast = ""
 	}
+
+	stats := app.engine.Stats()
+	app.sampleSpeeds(stats)
 
 	root := ui.Column(c).Fill().Background(t.Background)
 	if paths := root.DroppedFiles(); len(paths) > 0 {
@@ -285,18 +379,18 @@ func (app *App) View(c *ui.Context) {
 	}
 
 	root.Children(func() {
-		app.buildToolbar(c, &t)
+		app.buildHeader(c, &t, stats)
 		ui.Divider(c)
 
 		ui.Split(
 			c,
 			&app.cfg.SidebarWidth,
-			func() { app.buildSidebar(c, &t) },
-			func() { app.buildMainPane(c, &t) },
+			func() { app.buildSidebar(c, &t, stats) },
+			func() { app.buildMainPane(c, &t, stats) },
 		).SplitReset(220).Grow(1)
 
 		ui.Divider(c)
-		app.buildStatusBar(c, &t)
+		app.buildStatusBar(c, &t, stats)
 	})
 
 	// Confirmation dialogs
@@ -327,137 +421,117 @@ func (app *App) View(c *ui.Context) {
 		app.cfg = config.Default()
 		app.roleIndex = 0
 		app.portInput = strconv.Itoa(app.cfg.LocalPort)
+		app.statusBarNoticeSeen = app.cfg.TrayCloseNotice
 		app.saveConfig()
 		app.engine.UpdateConfig(app.cfg)
 		c.Toast("已恢复默认便携配置")
 	}
 }
 
-func (app *App) buildToolbar(c *ui.Context, t *ui.Theme) {
+func (app *App) buildHeader(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
 	running := app.engine.IsRunning()
-	stats := app.engine.Stats()
-	tunState, pubURL, lanURL, _ := app.tunnel.State()
 
-	ui.Row(c).Padding(t.Space(2), t.Space(3)).Gap(t.Space(2)).Background(t.Surface).Children(func() {
+	ui.Row(c).Padding(t.Space(2), t.Space(4)).Gap(t.Space(2.5)).Background(t.Surface).Children(func() {
 		if AppLogoBitmap != nil {
-			ui.Image(c, AppLogoBitmap).Size(22, 22).Fit(ui.Contain)
+			ui.Image(c, AppLogoBitmap).Size(t.Space(6), t.Space(6)).Fit(ui.Contain)
 		} else {
 			ui.Icon(c, IconCloud).TextColor(t.Accent)
 		}
-		ui.Text(c, "SyncT").FontSize(t.Rem(1.1)).Bold()
-		ui.Badge(c, "Portable").Background(t.Accent.Alpha(0.15)).TextColor(t.Accent)
-		if app.cfg.LowPrivilegeMode {
-			ui.Badge(c, "User 权限克制").Background(t.Success.Alpha(0.15)).TextColor(t.Success)
-		}
-
-		if ui.Segmented(c, &app.roleIndex, "主机模式 (发布隧道)", "节点模式 (连接远端)").Label("工作模式").Changed() {
-			if running {
-				app.StopAll()
-			}
-			app.syncFieldsToConfig()
-			app.saveConfig()
-			app.engine.UpdateConfig(app.cfg)
-			if app.cfg.Role == config.RoleHost {
-				c.Toast("已切换为主机模式：开启 Cloudflared 隧道共享文件夹")
-			} else {
-				c.Toast("已切换为节点模式：连接到远端 Cloudflared 隧道")
-			}
-		}
+		ui.Column(c).Gap(0).Children(func() {
+			ui.Text(c, "SyncT").FontSize(t.Rem(1.02)).Bold()
+			ui.Text(c, "个人双机实时文件夹同步").TextColor(t.TextMuted).FontSize(t.Rem(0.8))
+		})
 
 		ui.Spacer(c)
+		app.buildStatusPill(c, t, stats)
 
-		ui.Toolbar(c, func() {
-			if !running {
-				startLabel := "启动隧道并同步"
-				if app.roleIndex == 1 {
-					startLabel = "连接隧道并同步"
-				}
-				if ui.PrimaryButton(c.Key("btn-start"), startLabel).Clicked() {
-					if err := app.StartAll(); err != nil {
-						c.Toast("启动失败: " + err.Error())
-					} else {
-						c.Toast("实时同步已启动")
-					}
-				}
-			} else {
-				if ui.Button(c.Key("btn-stop"), "停止同步").Clicked() {
-					app.StopAll()
-					c.Toast("已停止实时同步与隧道连接")
-				}
+		if running {
+			if ui.Button(c.Key("btn-stop"), "停止同步").Clicked() {
+				app.StopAll()
+				c.Toast("已停止实时同步与隧道连接")
 			}
-
-			if ui.Button(c.Key("btn-scan"), "立即扫描同步").Clicked() {
-				app.engine.TriggerManualSync()
-				c.Toast("已触发文件夹增量扫描与对账")
+		} else {
+			startLabel := "开始同步"
+			if app.roleIndex == 1 {
+				startLabel = "连接同步"
 			}
-
-			if app.cfg.Role == config.RoleHost && stats.TLSRejected {
-				if ui.Button(c.Key("btn-fix-502"), "修复 502 (信任本地证书)").Clicked() {
-					go app.fixTunnelTLS()
-					c.Toast("正在请求管理员权限安装本地证书并重启 cloudflared…")
-				}
-			}
-
-			if ui.Button(c.Key("btn-open-dir"), "打开同步目录").Clicked() {
-				if app.win != nil {
-					go mygo.Shell.OpenPath(app.cfg.SyncDir)
-				}
-				c.Toast("正在打开目录: " + app.cfg.SyncDir)
-			}
-
-			activeURL := pubURL
-			if activeURL == "" && app.cfg.CustomPublicURL != "" {
-				activeURL = app.cfg.CustomPublicURL
-			}
-			if activeURL == "" {
-				activeURL = lanURL
-			}
-			if app.cfg.Role == config.RoleClient && app.cfg.RemoteURL != "" {
-				activeURL = app.cfg.RemoteURL
-			}
-			shareCode := config.EncodeShareCode(activeURL, app.cfg.AuthToken)
-			if ui.Button(c.Key("btn-copy-code"), "复制连接码").Disabled(shareCode == "" && tunState == tunnel.TunnelStopped && stats.LocalPort == 0).Clicked() {
-				if shareCode == "" && stats.LocalPort > 0 {
-					shareCode = config.EncodeShareCode(fmt.Sprintf("https://localhost:%d", stats.LocalPort), app.cfg.AuthToken)
-				}
-				if shareCode != "" {
-					if app.win != nil {
-						mygo.Clipboard.WriteText(shareCode)
-					}
-					c.Toast("已复制 synct:// 一键连接码到剪贴板 (" + activeURL + ")")
+			if ui.PrimaryButton(c.Key("btn-start"), startLabel).Clicked() {
+				if err := app.StartAll(); err != nil {
+					c.Toast("启动失败: " + err.Error())
 				} else {
-					c.Toast("请先启动隧道或填写远端地址后再复制连接码")
+					c.Toast("实时同步已启动")
 				}
 			}
-		}).Label("主操作工具栏")
+		}
+
+		if ui.Button(c.Key("btn-scan"), "扫描").Tooltip("立即增量扫描本地文件夹并与远端对账").Clicked() {
+			app.engine.TriggerManualSync()
+			c.Toast("已触发文件夹增量扫描与对账")
+		}
+
+		ui.MenuButton(c.Key("menu-more"), "更多", func(m *ui.Menu) {
+			if m.Item("立即扫描同步").Chosen() {
+				app.engine.TriggerManualSync()
+				app.pendingToast = "已触发文件夹增量扫描与对账"
+				app.requestRedraw()
+			}
+			if m.Item("打开同步目录").Chosen() {
+				app.openPath(app.cfg.SyncDir)
+				app.pendingToast = "正在打开目录: " + app.cfg.SyncDir
+				app.requestRedraw()
+			}
+			m.Separator()
+			if m.Item("复制连接码").Chosen() {
+				app.copyShareCode(c)
+			}
+			if app.cfg.Role == config.RoleHost && stats.TLSRejected {
+				if m.Item("修复 502 (信任本地证书)").Chosen() {
+					go app.fixTunnelTLS()
+					app.pendingToast = "正在请求管理员权限安装本地证书并重启 cloudflared…"
+					app.requestRedraw()
+				}
+			}
+		}).Tooltip("扫描、打开目录、复制连接码")
 	})
 }
 
-func (app *App) buildSidebar(c *ui.Context, t *ui.Theme) {
-	stats := app.engine.Stats()
+func (app *App) buildStatusPill(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
+	color := app.stateColor(t, stats.State)
+	ui.Row(c).Padding(t.Space(1), t.Space(2.5)).Gap(t.Space(1.5)).Radius(t.Radius * 2).
+		Background(color.Alpha(0.12)).Children(func() {
+		ui.Box(c).Size(t.Space(1.75), t.Space(1.75)).Radius(t.Space(1)).Background(color)
+		ui.Text(c, string(stats.State)).TextColor(color).Bold().SingleLine()
+	})
+}
+
+func (app *App) buildSidebar(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
 	logsCount := app.engine.LogCount() + app.tunnel.LogCount()
 
 	ui.Column(c).Fill().Background(t.Surface).Children(func() {
 		ui.Sidebar(c, &app.section, func() {
-			ui.SidebarSection(c, "实时同步工作台", &app.navOpen, func() {
-				ui.SidebarItem(c, SectionOverview, IconCloud, "概览与隧道").Children(func() {
+			ui.SidebarSection(c, "同步", &app.navOpen, func() {
+				ui.SidebarItem(c, SectionOverview, IconCloud, "概览").Children(func() {
 					if app.engine.IsRunning() {
-						ui.Badge(c, "运行中").Background(t.Success).TextColor(t.AccentText)
+						ui.Badge(c, "运行中").Background(t.Success.Alpha(0.16)).TextColor(t.Success)
 					}
 				})
-				ui.SidebarItem(c, SectionFiles, IconFolder, "同步文件列表").Children(func() {
+				ui.SidebarItem(c, SectionFiles, IconFolder, "文件").Children(func() {
 					ui.Badge(c, strconv.Itoa(stats.TotalFiles))
 				})
-				ui.SidebarItem(c, SectionLogs, IconActivity, "实时传输日志").Children(func() {
+				ui.SidebarItem(c, SectionPending, IconClock, "未同步").Children(func() {
+					if stats.UnsyncedFiles > 0 {
+						ui.Badge(c, strconv.Itoa(stats.UnsyncedFiles)).
+							Background(t.Warning.Alpha(0.18)).TextColor(t.Warning)
+					}
+				})
+				ui.SidebarItem(c, SectionLogs, IconActivity, "日志").Children(func() {
 					if logsCount > 0 {
 						ui.Badge(c, strconv.Itoa(logsCount))
 					}
 				})
 			})
-			ui.SidebarSection(c, "便携配置与规则", &app.toolsOpen, func() {
-				ui.SidebarItem(c, SectionSettings, IconSettings, "忽略规则与设置").Children(func() {
-					ui.Badge(c, strconv.Itoa(len(app.cfg.IgnorePatterns)))
-				})
+			ui.SidebarSection(c, "配置", &app.toolsOpen, func() {
+				ui.SidebarItem(c, SectionSettings, IconSettings, "设置")
 			})
 		}).Grow(1)
 
@@ -467,333 +541,304 @@ func (app *App) buildSidebar(c *ui.Context, t *ui.Theme) {
 }
 
 func (app *App) buildBottomLeftSyncInfo(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
-	folderCnt := max(stats.FolderCount, 1)
-	ui.Column(c).Padding(t.Space(2.5)).Gap(t.Space(1.5)).Background(t.Surface).Children(func() {
+	ui.Column(c).Padding(t.Space(3)).Gap(t.Space(1.5)).Background(t.Surface).Children(func() {
 		ui.Row(c).Gap(t.Space(1.5)).Children(func() {
-			ui.Icon(c, IconActivity).TextColor(t.Accent)
-			ui.Text(c, "实时同步信息").Bold().Grow(1)
-			ui.Badge(c, fmt.Sprintf("%d 目录", folderCnt)).Background(t.Accent.Alpha(0.15)).TextColor(t.Accent)
+			ui.Text(c, "实时吞吐").Bold().Grow(1)
+			ui.Badge(c, fmt.Sprintf("%d 个目录", max(stats.FolderCount, 1))).
+				Background(t.Accent.Alpha(0.12)).TextColor(t.Accent)
 		})
 
-		// Real-time Upload / Download Speeds
 		ui.Row(c).Gap(t.Space(2)).Children(func() {
-			ui.Textf(c, "↑ %s", syncer.FormatSpeed(stats.UploadSpeed)).TextColor(t.Success).Bold().Grow(1).SingleLine()
-			ui.Textf(c, "↓ %s", syncer.FormatSpeed(stats.DownloadSpeed)).TextColor(t.Accent).Bold().Grow(1).SingleLine()
+			ui.Textf(c, "↑ %s", syncer.FormatSpeed(stats.UploadSpeed)).TextColor(t.Accent).Bold().Grow(1).SingleLine()
+			ui.Textf(c, "↓ %s", syncer.FormatSpeed(stats.DownloadSpeed)).TextColor(transferAccent).Bold().Grow(1).SingleLine()
 		})
 
-		// File Count & Total File Size
+		ui.Textf(c, "%d 个文件 · %d 个文件夹", stats.TotalFiles, stats.TotalDirs).
+			TextColor(t.TextMuted).FontSize(t.Rem(0.82)).SingleLine()
+
 		ui.Row(c).Gap(t.Space(1)).Children(func() {
-			ui.Text(c, "文件总计:").TextColor(t.TextMuted)
-			ui.Spacer(c)
-			ui.Textf(c, "%d 个 · %s", stats.TotalFiles, syncer.FormatBytes(stats.TotalBytes)).Bold().SingleLine()
+			ui.Textf(c, "总容量 %s", syncer.FormatBytes(stats.TotalBytes)).TextColor(t.TextMuted).FontSize(t.Rem(0.82)).Grow(1).SingleLine()
+			if stats.UnsyncedFiles > 0 {
+				ui.Textf(c, "%d 个未同步", stats.UnsyncedFiles).TextColor(t.Warning).FontSize(t.Rem(0.82)).SingleLine()
+			}
 		})
-
-		// Cumulative Upload / Download Size
-		ui.Row(c).Gap(t.Space(1)).Children(func() {
-			ui.Text(c, "累计流量:").TextColor(t.TextMuted)
-			ui.Spacer(c)
-			ui.Textf(c, "↑ %s / ↓ %s", syncer.FormatBytes(stats.BytesUploaded), syncer.FormatBytes(stats.BytesDownloaded)).TextColor(t.TextMuted).SingleLine()
-		})
-
-		// Latest synced file & its size
-		if stats.LastSyncFile != "" {
-			ui.Row(c).Gap(t.Space(1)).Children(func() {
-				ui.Text(c, "最近文件:").TextColor(t.TextMuted)
-				ui.Spacer(c)
-				ui.Textf(c, "%s (%s)", filepath.Base(stats.LastSyncFile), syncer.FormatBytes(stats.LastSyncBytes)).TextColor(t.TextMuted).SingleLine()
-			})
-		} else {
-			ui.Row(c).Gap(t.Space(1)).Children(func() {
-				ui.Text(c, "同步状态:").TextColor(t.TextMuted)
-				ui.Spacer(c)
-				ui.Text(c, string(stats.State)).TextColor(app.stateColor(t, stats.State)).SingleLine()
-			})
-		}
 	})
 }
 
-func (app *App) buildMainPane(c *ui.Context, t *ui.Theme) {
+func (app *App) buildMainPane(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
 	switch app.section {
 	case SectionFiles:
 		app.buildFilesPage(c, t)
+	case SectionPending:
+		app.buildPendingPage(c, t, stats)
 	case SectionLogs:
 		app.buildLogsPage(c, t)
 	case SectionSettings:
 		app.buildSettingsPage(c, t)
 	default:
-		app.buildOverviewPage(c, t)
+		app.buildOverviewPage(c, t, stats)
 	}
 }
 
-func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
-	stats := app.engine.Stats()
+func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
 	tunState, pubURL, lanURL, tunErr := app.tunnel.State()
 	binPath, binVer := app.tunnel.BinaryInfo()
 	downloading, dlProg := app.tunnel.IsDownloading()
 
 	ui.Scroll(c.Key("overview-scroll")).Fill().Children(func() {
-		ui.Column(c).Padding(t.Space(4)).Gap(t.Space(4)).Children(func() {
-			// 1. Live Status KPI Cards Row
-			ui.Grid(c).Columns(4).Gap(t.Space(3)).Children(func() {
-				app.buildStatCard(c, t, "同步状态", string(stats.State), app.stateSubtext(stats), app.stateColor(t, stats.State))
-				app.buildStatCard(c, t, "Cloudflared 隧道", string(tunState), app.tunnelSubtext(pubURL, lanURL), app.tunnelColor(t, tunState))
-				app.buildStatCard(c, t, "受控文件总数", fmt.Sprintf("%d 个文件 (%d 目录)", stats.TotalFiles, max(stats.FolderCount, 1)), "总容量 "+syncer.FormatBytes(stats.TotalBytes), t.Accent)
-				app.buildStatCard(c, t, "累计实时传输", fmt.Sprintf("↑ %s / ↓ %s", syncer.FormatBytes(stats.BytesUploaded), syncer.FormatBytes(stats.BytesDownloaded)), fmt.Sprintf("速率 ↑ %s · ↓ %s (%d 次事件)", syncer.FormatSpeed(stats.UploadSpeed), syncer.FormatSpeed(stats.DownloadSpeed), stats.SyncedEvents), t.Text)
-			})
-
-			// Error banner if any
-			if stats.LastError != "" || stats.HealthWarning != "" || stats.LastScanError != "" || tunErr != "" {
-				errMsg := stats.LastError
-				if errMsg == "" {
-					errMsg = stats.HealthWarning
-				}
-				if errMsg == "" {
-					errMsg = stats.LastScanError
-				}
-				if errMsg == "" {
-					errMsg = tunErr
-				}
+		ui.Column(c).Padding(t.Space(5)).Gap(t.Space(4)).Children(func() {
+			if msg := app.errorBannerText(stats, tunErr); msg != "" {
 				ui.Row(c).Padding(t.Space(3)).Gap(t.Space(2)).Radius(t.Radius).
-					Background(t.Danger.Alpha(0.12)).Border(1, t.Danger).Children(func() {
+					Background(t.Danger.Alpha(0.10)).Border(1, t.Danger.Alpha(0.5)).Children(func() {
 					ui.Badge(c, "异常提示").Background(t.Danger).TextColor(t.AccentText)
-					ui.Text(c, errMsg).TextColor(t.Danger).Grow(1)
+					ui.Text(c, msg).TextColor(t.Danger).Grow(1)
 				})
 			}
 
-			// 2. Folder & Connection Configuration Card
-			ui.Column(c).Padding(t.Space(4)).Gap(t.Space(3)).Radius(t.Radius).
-				Background(t.Surface).Border(1, t.Border).Children(func() {
-				ui.Row(c).Gap(t.Space(2)).Children(func() {
-					ui.Icon(c, IconFolder).TextColor(t.Accent)
-					ui.Text(c, "同步文件夹与隧道连接配置").FontSize(t.Rem(1.05)).Bold().Grow(1)
-					if ui.Button(c.Key("btn-save-cfg"), "保存配置").Clicked() {
-						app.syncFieldsToConfig()
-						if err := config.Save(app.cfg); err != nil {
-							c.Toast("保存配置失败: " + err.Error())
-						} else {
-							app.engine.UpdateConfig(app.cfg)
-							c.Toast("已保存便携配置至 data/config.json")
-						}
-					}
-				})
+			app.buildThroughputHero(c, t, stats)
+			app.buildLedger(c, t, stats)
 
-				ui.Divider(c)
-
-				ui.Form(c, func() {
-					// Sync Folder Picker
-					var dirErr string
-					if strings.TrimSpace(app.cfg.SyncDir) == "" {
-						dirErr = "请选择或输入需要实时同步的本地文件夹路径"
-					}
-					ui.Field(c, "指定同步文件夹", func() {
-						ui.Row(c).Gap(t.Space(2)).Children(func() {
-							if ui.TextInput(c.Key("input-sync-dir"), &app.cfg.SyncDir).Placeholder("例如 D:\\Work\\SharedFolder").Grow(1).Changed() {
-								if len(app.cfg.SyncFolders) > 0 {
-									app.cfg.SyncFolders[0].LocalPath = app.cfg.SyncDir
-								}
-								app.saveConfig()
-							}
-							if ui.Button(c.Key("btn-browse-dir"), "浏览选择…").Clicked() {
-								app.pickSyncDirectory(c)
-							}
-						})
-					}).Description("支持直接将文件从 Windows 资源管理器拖入本窗口自动同步").Error(dirErr)
-
-					// Sync Direction
-					dirIdx := syncDirectionIndex(app.cfg.SyncDirection)
-					ui.Field(c, "实时同步模式", func() {
-						choice := syncDirOptions[dirIdx]
-						if ui.Select(c.Key("sel-sync-dir"), &choice, syncDirOptions).Label("实时同步模式").Changed() {
-							app.cfg.SyncDirection = parseSyncDirection(choice)
-							app.saveConfig()
-							app.engine.UpdateConfig(app.cfg)
-							c.Toast("同步方向已更新为: " + choice)
-						}
-					}).Description("双向模式自动比对修改时间与哈希；冲突时默认保留副本防止误覆盖")
-
-					// Shared Auth Token
-					ui.Field(c, "安全访问密钥", func() {
-						ui.Row(c).Gap(t.Space(2)).Children(func() {
-							inp := ui.TextInput(c.Key("input-auth-token"), &app.cfg.AuthToken).Placeholder("输入用于两端认证的密钥").Grow(1)
-							if !app.showToken {
-								inp.Password()
-							}
-							ui.Toggle(c.Key("toggle-show-token"), &app.showToken, "显示密钥")
-							if ui.Button(c.Key("btn-gen-token"), "随机生成").Clicked() {
-								app.cfg.AuthToken = config.GenerateToken()
-								app.saveConfig()
-								app.engine.UpdateConfig(app.cfg)
-								c.Toast("已生成新的随机访问密钥")
-							}
-						})
-					}).Description("两端必须使用相同的访问密钥 (X-SyncT-Token) 才能读写同步文件")
-
-					// Mode-specific fields
-					if app.roleIndex == 0 {
-						// Host Mode settings
-						ui.Fieldset(c, "Cloudflared 隧道发布设置 (主机端)", func() {
-							tmIdx := tunnelModeIndex(app.cfg.TunnelMode)
-							ui.Field(c, "隧道运行方式", func() {
-								choice := tunnelModeOptions[tmIdx]
-								if ui.Select(c.Key("sel-tunnel-mode"), &choice, tunnelModeOptions).Label("隧道运行方式").Changed() {
-									app.cfg.TunnelMode = parseTunnelMode(choice)
-									app.saveConfig()
-									c.Toast("已切换隧道模式: " + choice)
-								}
-							}).Description("默认直接复用本机系统已在运行的 Cloudflared 服务，无需重复启动进程或填写 Token")
-
-							if app.cfg.TunnelMode == config.TunnelSystem {
-								ui.Row(c).Padding(t.Space(2.5)).Gap(t.Space(2)).Radius(t.Radius).
-									Background(t.Success.Alpha(0.10)).Border(1, t.Success.Alpha(0.4)).Children(func() {
-									ui.Badge(c, "复用系统隧道").Background(t.Success).TextColor(t.AccentText)
-									statusText := "已自动对接本机正在运行的系统 Cloudflared 服务，直接将 https://localhost:18920 映射至 https://synctreei.suosmanthus.cyou。"
-									if binVer != "" {
-										statusText = fmt.Sprintf("%s · 直接复用系统隧道将 https://localhost:18920 发布至 %s，无需再次启动 cloudflared。", binVer, app.cfg.CustomPublicURL)
-									}
-									ui.Text(c, statusText).TextColor(t.Text).Grow(1)
-								})
-
-								ui.Field(c, "绑定的公网域名", func() {
-									if ui.TextInput(c.Key("input-custom-pub-url"), &app.cfg.CustomPublicURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
-										app.saveConfig()
-									}
-								}).Description("已预设系统 Cloudflared 绑定的专属域名 https://synctreei.suosmanthus.cyou")
-							}
-
-							if app.cfg.TunnelMode == config.TunnelToken {
-								ui.Field(c, "Tunnel Token", func() {
-									ui.TextInput(c.Key("input-tunnel-token"), &app.cfg.TunnelToken).Placeholder("eyJhIjoi... (Cloudflare Zero Trust 隧道 Token)").Password()
-								}).Description("在 Cloudflare Zero Trust 控制台创建的固定隧道 Token")
-
-								ui.Field(c, "绑定的公网域名", func() {
-									if ui.TextInput(c.Key("input-custom-pub-url"), &app.cfg.CustomPublicURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
-										app.saveConfig()
-									}
-								}).Description("已预设自用专属域名 https://synctreei.suosmanthus.cyou")
-							}
-
-							var portErr string
-							if p, err := strconv.Atoi(strings.TrimSpace(app.portInput)); err != nil || p <= 0 || p > 65535 {
-								portErr = "请输入 1 ~ 65535 之间的有效本地端口号"
-							}
-							ui.Field(c, "本地监听端口", func() {
-								ui.Row(c).Gap(t.Space(2)).Children(func() {
-									if ui.TextInput(c.Key("input-local-port"), &app.portInput).Placeholder("18920").Grow(1).Changed() {
-										app.syncFieldsToConfig()
-										app.saveConfig()
-									}
-									ui.Badge(c, fmt.Sprintf("https://localhost:%s", strings.TrimSpace(app.portInput))).
-										Background(t.Accent.Alpha(0.15)).TextColor(t.Accent)
-								})
-							}).Description("仅绑定本机回环 (127.0.0.1 / ::1)，内建自签名 TLS 证书并同时兼容 HTTPS 与 HTTP，不触发防火墙提权弹窗").Error(portErr)
-						})
-					} else {
-						// Client Mode settings
-						ui.Fieldset(c, "远端 Cloudflared 隧道连接设置 (节点端 · 工作电脑 User 低权限)", func() {
-							ui.Row(c).Padding(t.Space(2.5)).Gap(t.Space(2)).Radius(t.Radius).
-								Background(t.Success.Alpha(0.10)).Border(1, t.Success.Alpha(0.4)).Children(func() {
-								ui.Badge(c, "User 权限克制").Background(t.Success).TextColor(t.AccentText)
-								ui.Text(c, "工作电脑客户端模式：零本地端口监听、无需启动 cloudflared.exe、零注册表写入，仅通过标准 HTTPS (443) 双向同步 https://synctreei.suosmanthus.cyou。").
-									TextColor(t.Text).Grow(1)
-							})
-
-							ui.Field(c, "一键连接码解析", func() {
-								ui.Row(c).Gap(t.Space(2)).Children(func() {
-									ui.TextInput(c.Key("input-share-code"), &app.shareInput).Placeholder("粘贴 synct://connect/... 连接码或直接粘贴 st_... 访问密钥").Grow(1)
-									if ui.Button(c.Key("btn-paste-code"), "从剪贴板粘贴").Clicked() {
-										if app.win != nil {
-											clip := strings.TrimSpace(mygo.Clipboard.ReadText())
-											if clip != "" {
-												app.shareInput = clip
-											}
-										}
-										app.applyShareCodeInput(c)
-									}
-									if ui.Button(c.Key("btn-parse-code"), "解析填充").Disabled(strings.TrimSpace(app.shareInput) == "").Clicked() {
-										app.applyShareCodeInput(c)
-									}
-								})
-							}).Description("在本机服务端点击「复制连接码」后，可在工作电脑一键导入隧道域名与访问密钥")
-
-							var remoteErr string
-							if strings.TrimSpace(app.cfg.RemoteURL) == "" {
-								remoteErr = "请填写 https://synctreei.suosmanthus.cyou 或其他隧道域名"
-							}
-							ui.Field(c, "远端隧道地址", func() {
-								if ui.TextInput(c.Key("input-remote-url"), &app.cfg.RemoteURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
-									app.saveConfig()
-									app.engine.UpdateConfig(app.cfg)
-								}
-							}).Description("已默认预设为 https://synctreei.suosmanthus.cyou").Error(remoteErr)
-						})
-					}
-
-					app.buildFolderMappingsSection(c, t)
-				})
+			ui.Grid(c).Columns(2).Gap(t.Space(4)).Children(func() {
+				app.buildFolderPanel(c, t)
+				app.buildConnectionPanel(c, t, stats, tunState, pubURL, lanURL)
 			})
 
-			// 3. Share Code & Cloudflared Environment Card
-			ui.Column(c).Padding(t.Space(4)).Gap(t.Space(3)).Radius(t.Radius).
-				Background(t.Surface).Border(1, t.Border).Children(func() {
-				ui.Row(c).Gap(t.Space(2)).Children(func() {
-					ui.Icon(c, IconShield).TextColor(t.Accent)
-					ui.Text(c, "系统 Cloudflared 状态与双机连接分享").FontSize(t.Rem(1.05)).Bold().Grow(1)
-					if binPath != "" {
-						ui.Badge(c, "系统隧道就绪").Background(t.Success).TextColor(t.AccentText)
-					} else {
-						ui.Badge(c, "仅客户端/未检测").Background(t.Warning).TextColor(t.AccentText)
-					}
-				})
+			// When cloudflared is present and idle this is setup trivia; show
+			// the panel only while it needs attention.
+			if downloading || binPath == "" {
+				app.buildCloudflaredPanel(c, t, binPath, binVer, downloading, dlProg)
+			}
+		})
+	})
+}
 
-				ui.Divider(c)
-
-				if binPath != "" {
-					ui.Textf(c, "当前 Cloudflared 来源: %s", binPath).TextColor(t.Text)
-					if binVer != "" {
-						ui.Textf(c, "运行状态与版本: %s", binVer).TextColor(t.TextMuted)
-					}
-				} else {
-					ui.Text(c, "当前未检测到本地 cloudflared 进程（工作电脑客户端无需安装或运行 cloudflared）。").TextColor(t.TextMuted)
-				}
-
-				if downloading {
-					ui.Progress(c, dlProg).Label("正在下载便携版 cloudflared.exe")
-				}
-
-				activeURL := pubURL
-				if activeURL == "" {
-					activeURL = lanURL
-				}
-				if app.cfg.Role == config.RoleClient && app.cfg.RemoteURL != "" {
-					activeURL = app.cfg.RemoteURL
-				}
-				shareCode := config.EncodeShareCode(activeURL, app.cfg.AuthToken)
-				if activeURL != "" {
-					ui.Column(c).Padding(t.Space(3)).Gap(t.Space(1)).Radius(t.Radius).
-						Background(t.Background).Border(1, t.Border).Children(func() {
-						ui.Textf(c, "当前活动隧道地址: %s", activeURL).Bold()
-						ui.Textf(c, "一键分享连接码: %s", shareCode).TextColor(t.TextMuted).SingleLine()
+func (app *App) buildThroughputHero(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
+	ui.Column(c).FillWidth().Padding(t.Space(5)).Gap(t.Space(3)).Radius(t.Radius).
+		Background(t.Surface).Border(1, t.Border).Children(func() {
+		ui.Row(c).AlignItems(ui.End).Gap(t.Space(3)).Children(func() {
+			ui.Column(c).Gap(t.Space(1)).Grow(1).Children(func() {
+				ui.Text(c, "当前吞吐").TextColor(t.TextMuted).FontSize(t.Rem(0.84))
+				ui.Row(c).Gap(t.Space(4)).Children(func() {
+					ui.Row(c).AlignItems(ui.Baseline).Gap(t.Space(1.5)).Children(func() {
+						ui.Textf(c, "↑ %s", syncer.FormatSpeed(stats.UploadSpeed)).
+							FontSize(t.Rem(1.75)).Bold().TextColor(t.Accent).SingleLine()
+						ui.Text(c, "上传").TextColor(t.TextMuted).FontSize(t.Rem(0.84))
 					})
-				}
-
-				ui.Row(c).Gap(t.Space(2)).Children(func() {
-					if ui.Button(c.Key("btn-detect-cf"), "重新检测组件").Clicked() {
-						app.refreshBinaryAsync()
-						c.Toast("正在重新检测 Cloudflared 组件…")
-					}
-					if ui.Button(c.Key("btn-dl-cf"), "自动下载便携版 cloudflared.exe").Disabled(downloading).Clicked() {
-						c.Toast("开始下载官方便携版 cloudflared.exe 至 bin 目录…")
-						app.tunnel.DownloadPortableBinary(func(savedPath string, err error) {
-							if err != nil {
-								app.pendingToast = "下载 cloudflared.exe 失败: " + err.Error()
-							} else {
-								app.pendingToast = "便携版 cloudflared.exe 下载完成！"
-							}
-							app.requestRedraw()
-						})
-					}
+					ui.Row(c).AlignItems(ui.Baseline).Gap(t.Space(1.5)).Children(func() {
+						ui.Textf(c, "↓ %s", syncer.FormatSpeed(stats.DownloadSpeed)).
+							FontSize(t.Rem(1.75)).Bold().TextColor(transferAccent).SingleLine()
+						ui.Text(c, "下载").TextColor(t.TextMuted).FontSize(t.Rem(0.84))
+					})
 				})
 			})
+
+			ui.Column(c).Gap(t.Space(0.5)).Children(func() {
+				ui.Text(c, string(stats.State)).Bold().TextColor(app.stateColor(t, stats.State)).SingleLine()
+				ui.Text(c, app.stateSubtext(stats)).TextColor(t.TextMuted).FontSize(t.Rem(0.84)).SingleLine()
+			})
+		})
+
+		if app.traceHasActivity() {
+			app.buildThroughputTrace(c, t, stats)
+		} else {
+			ui.Row(c).FillWidth().Height(t.Space(8)).Center().Children(func() {
+				ui.Text(c, "有文件传输时，这里会绘制最近 30 秒的上行与下行速率。").
+					TextColor(t.TextMuted).FontSize(t.Rem(0.82))
+			})
+		}
+
+		ui.Row(c).Gap(t.Space(3)).Children(func() {
+			app.traceLegend(c, t, t.Accent, "上传")
+			app.traceLegend(c, t, transferAccent, "下载")
+			ui.Spacer(c)
+			ui.Text(c, "最近 30 秒").TextColor(t.TextMuted).FontSize(t.Rem(0.78))
+		})
+	})
+}
+
+func (app *App) traceLegend(c *ui.Context, t *ui.Theme, color ui.Color, label string) {
+	ui.Row(c).Gap(t.Space(1)).Children(func() {
+		ui.Box(c).Size(t.Space(1.5), t.Space(1.5)).Radius(t.Space(0.75)).Background(color)
+		ui.Text(c, label).TextColor(t.TextMuted).FontSize(t.Rem(0.8))
+	})
+}
+
+func (app *App) traceHasActivity() bool {
+	for _, s := range app.speedHistory {
+		if s.up > 0 || s.down > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// buildThroughputTrace paints the two rate series directly. A chart library
+// would need axes and labels that this quiet instrument does not show.
+func (app *App) buildThroughputTrace(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
+	trace := ui.Box(c).FillWidth().Height(t.Space(13))
+	trace.Draw(func(p *ui.Painter, r ui.Rect) {
+		for i := 0; i <= 2; i++ {
+			y := r.Y + r.H*float32(i)/2
+			p.Line(r.X, y, r.X+r.W, y, 1, t.Border.Alpha(0.55))
+		}
+		samples := app.speedHistory
+		if len(samples) < 2 {
+			return
+		}
+		var peak int64 = 1
+		for _, s := range samples {
+			if s.up > peak {
+				peak = s.up
+			}
+			if s.down > peak {
+				peak = s.down
+			}
+		}
+		step := r.W / float32(len(samples)-1)
+		up := make([][2]float32, 0, len(samples))
+		down := make([][2]float32, 0, len(samples))
+		for i, s := range samples {
+			x := r.X + step*float32(i)
+			up = append(up, [2]float32{x, r.Y + r.H - float32(s.up)/float32(peak)*r.H})
+			down = append(down, [2]float32{x, r.Y + r.H - float32(s.down)/float32(peak)*r.H})
+		}
+		p.StrokePolyline(up, 1.6, t.Accent)
+		p.StrokePolyline(down, 1.6, transferAccent)
+	})
+}
+
+func (app *App) buildLedger(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
+	ui.Row(c).FillWidth().Padding(t.Space(3), t.Space(4)).Gap(t.Space(4)).
+		Radius(t.Radius).Background(t.Surface).Border(1, t.Border).
+		Dividers(1, t.Border).Children(func() {
+		app.metric(c, t, "受控文件", fmt.Sprintf("%d", stats.TotalFiles), "个文件")
+		app.metric(c, t, "未同步", fmt.Sprintf("%d", stats.UnsyncedFiles), "个待对端确认")
+		app.metric(c, t, "映射目录", fmt.Sprintf("%d", max(stats.FolderCount, 1)), fmt.Sprintf("含 %d 个子文件夹", stats.TotalDirs))
+		app.metric(c, t, "本次累计流量",
+			fmt.Sprintf("↑ %s", syncer.FormatBytes(stats.BytesUploaded)),
+			fmt.Sprintf("↓ %s", syncer.FormatBytes(stats.BytesDownloaded)))
+	})
+}
+
+func (app *App) metric(c *ui.Context, t *ui.Theme, label, value, sub string) {
+	ui.Column(c).Grow(1).Gap(t.Space(0.5)).Children(func() {
+		ui.Text(c, label).TextColor(t.TextMuted).FontSize(t.Rem(0.8)).SingleLine()
+		ui.Text(c, value).FontSize(t.Rem(1.15)).Bold().SingleLine()
+		ui.Text(c, sub).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
+	})
+}
+
+func (app *App) buildFolderPanel(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).Padding(t.Space(4)).Gap(t.Space(2.5)).Radius(t.Radius).
+		Background(t.Surface).Border(1, t.Border).Children(func() {
+		ui.Row(c).Gap(t.Space(2)).Children(func() {
+			ui.Icon(c, IconFolder).TextColor(t.Accent)
+			ui.Text(c, "同步文件夹").Bold().Grow(1)
+			if ui.Button(c.Key("btn-manage-folders"), "管理").Clicked() {
+				app.section = SectionSettings
+				app.settingsFoldersOpen = true
+			}
+		})
+
+		folders := app.cfg.EnabledFolders()
+		shown := folders
+		if len(shown) > 4 {
+			shown = shown[:4]
+		}
+		for i := range shown {
+			folder := shown[i]
+			ui.Row(c).Gap(t.Space(2)).Children(func() {
+				ui.Box(c).Size(t.Space(1.5), t.Space(1.5)).Radius(t.Space(0.75)).Background(t.Success).Margin(t.Space(0.5), 0, 0, 0)
+				ui.Column(c).Gap(0).Grow(1).Children(func() {
+					ui.Text(c, folder.Label).SingleLine()
+					ui.Text(c, folder.LocalPath).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
+				})
+				if ui.Button(c.Key(fmt.Sprintf("btn-ov-open-%d", i)), "打开").Clicked() {
+					app.openPath(folder.LocalPath)
+					c.Toast("正在打开目录: " + folder.LocalPath)
+				}
+			})
+		}
+		if len(folders) > len(shown) {
+			ui.Textf(c, "还有 %d 个文件夹，在设置中管理", len(folders)-len(shown)).TextColor(t.TextMuted).FontSize(t.Rem(0.8))
+		}
+		if len(folders) == 0 {
+			ui.Text(c, "尚未选择同步文件夹。").TextColor(t.TextMuted)
+		}
+	})
+}
+
+func (app *App) buildConnectionPanel(c *ui.Context, t *ui.Theme, stats syncer.Stats, tunState tunnel.TunnelState, pubURL, lanURL string) {
+	ui.Column(c).Padding(t.Space(4)).Gap(t.Space(2.5)).Radius(t.Radius).
+		Background(t.Surface).Border(1, t.Border).Children(func() {
+		ui.Row(c).Gap(t.Space(2)).Children(func() {
+			ui.Icon(c, IconCloud).TextColor(t.Accent)
+			ui.Text(c, "连接").Bold().Grow(1)
+			ui.Badge(c, string(tunState)).Background(app.tunnelColor(t, tunState).Alpha(0.14)).
+				TextColor(app.tunnelColor(t, tunState))
+		})
+
+		activeURL := app.activeShareURL(stats, pubURL, lanURL)
+		if activeURL == "" {
+			ui.Text(c, app.tunnelSubtext(pubURL, lanURL)).TextColor(t.TextMuted)
+		} else {
+			ui.Text(c, activeURL).Bold().SingleLine()
+		}
+
+		detail := app.stateSubtext(stats)
+		if app.cfg.Role == config.RoleHost {
+			detail = fmt.Sprintf("在线节点 %d · 本地端口 %d", stats.ConnectedPeers, max(stats.LocalPort, 0))
+		}
+		ui.Text(c, detail).TextColor(t.TextMuted).FontSize(t.Rem(0.82)).SingleLine()
+
+		ui.Row(c).Gap(t.Space(2)).Children(func() {
+			if ui.Button(c.Key("btn-copy-code"), "复制连接码").Clicked() {
+				app.copyShareCode(c)
+			}
+			if app.cfg.Role == config.RoleHost && stats.TLSRejected {
+				if ui.Button(c.Key("btn-fix-502"), "修复 502").Tooltip("将本地自签名证书安装到受信任根，并重启 cloudflared").Clicked() {
+					go app.fixTunnelTLS()
+					c.Toast("正在请求管理员权限安装本地证书并重启 cloudflared…")
+				}
+			}
+		})
+	})
+}
+
+func (app *App) buildCloudflaredPanel(c *ui.Context, t *ui.Theme, binPath, binVer string, downloading bool, dlProg float64) {
+	ui.Column(c).Padding(t.Space(4)).Gap(t.Space(2)).Radius(t.Radius).
+		Background(t.Surface).Border(1, t.Border).Children(func() {
+		ui.Row(c).Gap(t.Space(2)).Children(func() {
+			ui.Icon(c, IconShield).TextColor(t.Accent)
+			ui.Text(c, "Cloudflared 组件").Bold().Grow(1)
+			if binPath != "" {
+				ui.Badge(c, "就绪").Background(t.Success.Alpha(0.16)).TextColor(t.Success)
+			} else {
+				ui.Badge(c, "未检测到").Background(t.Warning.Alpha(0.16)).TextColor(t.Warning)
+			}
+		})
+		if binVer != "" {
+			ui.Text(c, binVer).TextColor(t.TextMuted).FontSize(t.Rem(0.8)).SingleLine()
+		}
+		if downloading {
+			ui.Progress(c, dlProg).Label("正在下载便携版 cloudflared.exe")
+		}
+		ui.Row(c).Gap(t.Space(2)).Children(func() {
+			if ui.Button(c.Key("btn-detect-cf"), "重新检测").Clicked() {
+				app.refreshBinaryAsync()
+				c.Toast("正在重新检测 Cloudflared 组件…")
+			}
+			if ui.Button(c.Key("btn-dl-cf"), "下载便携版").Disabled(downloading).Clicked() {
+				c.Toast("开始下载官方便携版 cloudflared.exe 至 bin 目录…")
+				app.tunnel.DownloadPortableBinary(func(savedPath string, err error) {
+					if err != nil {
+						app.pendingToast = "下载 cloudflared.exe 失败: " + err.Error()
+					} else {
+						app.pendingToast = "便携版 cloudflared.exe 下载完成！"
+					}
+					app.requestRedraw()
+				})
+			}
 		})
 	})
 }
@@ -801,51 +846,55 @@ func (app *App) buildOverviewPage(c *ui.Context, t *ui.Theme) {
 func (app *App) buildFilesPage(c *ui.Context, t *ui.Theme) {
 	allFiles, version := app.engine.FilesWithVersion()
 	filtered := app.cachedVisibleFiles(allFiles, version)
+	unsynced := 0
+	for _, f := range allFiles {
+		if f.Status != syncer.StatusSynced {
+			unsynced++
+		}
+	}
 
 	ui.Column(c).Fill().Padding(t.Space(4)).Gap(t.Space(3)).Children(func() {
-		// Search & filter bar
-		ui.Row(c).Gap(t.Space(3)).Children(func() {
+		ui.Row(c).Gap(t.Space(2.5)).Children(func() {
 			ui.SearchField(c.Key("search-files"), &app.fileSearch).
-				Placeholder("搜索文件名、相对路径或同步方向…").
+				Placeholder("搜索文件名、目录或状态…").
 				Label("搜索同步文件").
 				Grow(1)
 
-			ui.Segmented(c.Key("seg-file-filter"), &app.fileFilterIdx, "全部文件", "已同步", "传输中/冲突").
+			ui.Segmented(c.Key("seg-file-filter"), &app.fileFilterIdx, "全部", "已同步", "未同步").
 				Label("按状态筛选")
 
-			if ui.Button(c.Key("btn-rescan-files"), "刷新列表").Clicked() {
+			if ui.Button(c.Key("btn-open-dir"), "打开目录").Clicked() {
+				app.openPath(app.cfg.SyncDir)
+				c.Toast("正在打开目录: " + app.cfg.SyncDir)
+			}
+		})
+
+		ui.Row(c).Gap(t.Space(2)).Children(func() {
+			ui.Textf(c, "共 %d 个文件 · %d 个尚未确认同步", len(allFiles), unsynced).
+				TextColor(t.TextMuted).FontSize(t.Rem(0.82))
+			ui.Spacer(c)
+			if ui.Button(c.Key("btn-rescan-files"), "刷新").Clicked() {
 				app.engine.TriggerManualSync()
 				c.Toast("已刷新本地同步文件索引")
 			}
 		})
 
-		// Table container with surface face
 		ui.Column(c).Grow(1).Radius(t.Radius).Background(t.Surface).Border(1, t.Border).Children(func() {
 			if len(filtered) == 0 {
-				ui.Column(c).Fill().Center().Gap(t.Space(3)).Padding(t.Space(6)).Children(func() {
-					ui.Icon(c, IconFolder).TextColor(t.TextMuted)
-					if len(allFiles) == 0 {
-						ui.Text(c, "当前同步文件夹中暂无文件，您可以放入文件或直接将文件拖入窗口。").TextColor(t.TextMuted)
-					} else {
-						ui.Text(c, "没有匹配当前搜索条件或状态筛选的文件。").TextColor(t.TextMuted)
-					}
-					if ui.Button(c.Key("btn-empty-open"), "打开同步目录").Clicked() {
-						if app.win != nil {
-							go mygo.Shell.OpenPath(app.cfg.SyncDir)
-						}
+				app.emptyState(c, t, IconFolder,
+					app.emptyFilesText(len(allFiles)), "打开同步目录", func() {
+						app.openPath(app.cfg.SyncDir)
 						c.Toast("正在打开同步目录: " + app.cfg.SyncDir)
-					}
-				})
+					})
 				return
 			}
 
 			cols := []ui.TableColumn{
-				{ID: "folder", Title: "所属目录", Width: 130, Sortable: true},
-				{ID: "path", Title: "相对路径", Sortable: true},
-				{ID: "size", Title: "大小", Width: 105, Align: ui.End, Sortable: true},
-				{ID: "mtime", Title: "最后修改时间", Width: 160, Sortable: true},
-				{ID: "dir", Title: "同步方向", Width: 115, Sortable: true},
-				{ID: "status", Title: "状态", Width: 105, Sortable: true},
+				{ID: "folder", Title: "目录", Width: 108, Sortable: true},
+				{ID: "path", Title: "文件", Sortable: true},
+				{ID: "size", Title: "大小", Width: 92, Align: ui.End, Sortable: true},
+				{ID: "mtime", Title: "修改时间", Width: 150, Sortable: true},
+				{ID: "status", Title: "状态", Width: 96, Sortable: true},
 			}
 
 			app.fileTableState.Sort = &app.fileSort
@@ -883,45 +932,137 @@ func (app *App) buildFilesPage(c *ui.Context, t *ui.Theme) {
 				item := filtered[row]
 				switch col {
 				case 0:
-					ui.Text(c, item.FolderLabel).TextColor(t.Accent).SingleLine()
+					ui.Text(c, item.FolderLabel).TextColor(t.TextMuted).SingleLine()
 				case 1:
 					ui.Text(c, item.RelPath).SingleLine()
 				case 2:
 					ui.Text(c, syncer.FormatBytes(item.Size)).SingleLine()
 				case 3:
-					ui.Text(c, item.ModTime.Format("2006-01-02 15:04:05")).TextColor(t.TextMuted).SingleLine()
+					ui.Text(c, item.ModTime.Format("2006-01-02 15:04")).TextColor(t.TextMuted).SingleLine()
 				case 4:
-					ui.Text(c, item.Direction).TextColor(t.TextMuted).SingleLine()
-				case 5:
-					ui.Text(c, string(item.Status)).TextColor(app.fileStatusColor(t, item.Status)).Bold().SingleLine()
+					if item.Status == syncer.StatusSynced {
+						ui.Text(c, string(item.Status)).TextColor(t.TextMuted).SingleLine()
+					} else {
+						ui.Text(c, string(item.Status)).TextColor(app.fileStatusColor(t, item.Status)).Bold().SingleLine()
+					}
 				}
 			}).Grow(1).Submitted() {
 				if app.selectedFileRow >= 0 && app.selectedFileRow < len(filtered) {
-					full := app.resolveEntryFullPath(filtered[app.selectedFileRow].RelPath)
-					actionRevealPath = full
+					actionRevealPath = app.resolveEntryFullPath(filtered[app.selectedFileRow].RelPath)
 				}
 			}
 
-			if actionOpenPath != "" {
-				if app.win != nil {
-					go mygo.Shell.OpenPath(actionOpenPath)
+			app.applyFileActions(c, actionOpenPath, actionRevealPath, actionCopyRel)
+		})
+	})
+}
+
+func (app *App) emptyFilesText(total int) string {
+	if total == 0 {
+		return "同步文件夹还是空的。放入文件，或把文件直接拖进这个窗口。"
+	}
+	return "没有文件匹配当前的搜索或筛选条件。"
+}
+
+func (app *App) buildPendingPage(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
+	allFiles, _ := app.engine.FilesWithVersion()
+	pending := pendingFiles(allFiles)
+	filtered := pending
+	if col := app.pendingSort.Column; col != "" {
+		// Sorting is offered on this table too; the small list keeps the same
+		// comparator as the files page.
+		sortPending(filtered, app.pendingSort)
+	}
+
+	ui.Column(c).Fill().Padding(t.Space(4)).Gap(t.Space(3)).Children(func() {
+		ui.Row(c).AlignItems(ui.End).Gap(t.Space(3)).Children(func() {
+			ui.Column(c).Gap(t.Space(0.5)).Grow(1).Children(func() {
+				ui.Text(c, "未同步文件").FontSize(t.Rem(1.15)).Bold()
+				ui.Text(c, "这些文件还没有在对端确认。运行同步后，它们会自动上传或下载；错误与冲突会留在列表中等待处理。").
+					TextColor(t.TextMuted).FontSize(t.Rem(0.84))
+			})
+			if ui.Button(c.Key("btn-pending-scan"), "立即扫描并同步").Clicked() {
+				app.engine.TriggerManualSync()
+				c.Toast("已触发文件夹增量扫描与对账")
+			}
+		})
+
+		ui.Column(c).Grow(1).Radius(t.Radius).Background(t.Surface).Border(1, t.Border).Children(func() {
+			if len(filtered) == 0 {
+				app.emptyState(c, t, IconCheckCircle, "所有文件都已确认同步，没有待处理项。", "", nil)
+				return
+			}
+
+			cols := []ui.TableColumn{
+				{ID: "path", Title: "文件", Sortable: true},
+				{ID: "folder", Title: "目录", Width: 110, Sortable: true},
+				{ID: "status", Title: "状态", Width: 100, Sortable: true},
+				{ID: "size", Title: "大小", Width: 92, Align: ui.End, Sortable: true},
+				{ID: "mtime", Title: "修改时间", Width: 150, Sortable: true},
+			}
+
+			app.pendingTableState.Sort = &app.pendingSort
+			app.pendingTableState.Selected = &app.selectedPendingRow
+			app.pendingTableState.Key = func(row int) any {
+				if row >= 0 && row < len(filtered) {
+					return filtered[row].RelPath
 				}
-				c.Toast("已打开文件: " + filepath.Base(actionOpenPath))
+				return row
+			}
+
+			var actionRevealPath string
+			if ui.Table(c, &app.pendingTableState, cols, len(filtered), func(row, col int) {
+				item := filtered[row]
+				switch col {
+				case 0:
+					ui.Text(c, item.RelPath).SingleLine()
+				case 1:
+					ui.Text(c, item.FolderLabel).TextColor(t.TextMuted).SingleLine()
+				case 2:
+					ui.Text(c, string(item.Status)).TextColor(app.fileStatusColor(t, item.Status)).Bold().SingleLine()
+				case 3:
+					ui.Text(c, syncer.FormatBytes(item.Size)).SingleLine()
+				case 4:
+					ui.Text(c, item.ModTime.Format("2006-01-02 15:04")).TextColor(t.TextMuted).SingleLine()
+				}
+			}).Grow(1).Submitted() {
+				if app.selectedPendingRow >= 0 && app.selectedPendingRow < len(filtered) {
+					actionRevealPath = app.resolveEntryFullPath(filtered[app.selectedPendingRow].RelPath)
+				}
 			}
 			if actionRevealPath != "" {
-				if app.win != nil {
-					go mygo.Shell.ShowItemInFolder(actionRevealPath)
-				}
+				app.revealPath(actionRevealPath)
 				c.Toast("已在资源管理器中定位: " + filepath.Base(actionRevealPath))
-			}
-			if actionCopyRel != "" {
-				if app.win != nil {
-					mygo.Clipboard.WriteText(actionCopyRel)
-				}
-				c.Toast("已复制路径: " + actionCopyRel)
 			}
 		})
 	})
+}
+
+func (app *App) emptyState(c *ui.Context, t *ui.Theme, icon *ui.SVG, text, actionLabel string, action func()) {
+	ui.Column(c).Fill().Center().Gap(t.Space(3)).Padding(t.Space(6)).Children(func() {
+		ui.Icon(c, icon).TextColor(t.TextMuted).FontSize(t.Space(7))
+		ui.Text(c, text).TextColor(t.TextMuted)
+		if actionLabel != "" && action != nil {
+			if ui.Button(c.Key("btn-empty-action"), actionLabel).Clicked() {
+				action()
+			}
+		}
+	})
+}
+
+func (app *App) applyFileActions(c *ui.Context, openPath, revealPath, copyRel string) {
+	if openPath != "" {
+		app.openPath(openPath)
+		c.Toast("已打开文件: " + filepath.Base(openPath))
+	}
+	if revealPath != "" {
+		app.revealPath(revealPath)
+		c.Toast("已在资源管理器中定位: " + filepath.Base(revealPath))
+	}
+	if copyRel != "" {
+		app.writeClipboard(copyRel)
+		c.Toast("已复制路径: " + copyRel)
+	}
 }
 
 func (app *App) buildLogsPage(c *ui.Context, t *ui.Theme) {
@@ -930,12 +1071,12 @@ func (app *App) buildLogsPage(c *ui.Context, t *ui.Theme) {
 
 	ui.Column(c).Fill().Padding(t.Space(4)).Gap(t.Space(3)).Children(func() {
 		ui.Row(c).Gap(t.Space(3)).Children(func() {
-			ui.Tabs(c, &app.logTab, "实时同步活动日志", "Cloudflared 隧道控制台输出")
+			ui.Tabs(c, &app.logTab, "同步活动", "隧道输出")
 			ui.Spacer(c)
-			if ui.Button(c.Key("btn-copy-logs"), "复制当前日志").Clicked() {
+			if ui.Button(c.Key("btn-copy-logs"), "复制").Clicked() {
 				text := app.formatCurrentLogsText(syncLogs, tunLogs)
-				if app.win != nil && text != "" {
-					mygo.Clipboard.WriteText(text)
+				if text != "" {
+					app.writeClipboard(text)
 				}
 				c.Toast("已复制当前日志内容至剪贴板")
 			}
@@ -947,10 +1088,7 @@ func (app *App) buildLogsPage(c *ui.Context, t *ui.Theme) {
 		ui.Column(c).Grow(1).Radius(t.Radius).Background(t.Surface).Border(1, t.Border).Children(func() {
 			if app.logTab == 0 {
 				if len(syncLogs) == 0 {
-					ui.Column(c).Fill().Center().Gap(t.Space(2)).Padding(t.Space(6)).Children(func() {
-						ui.Icon(c, IconActivity).TextColor(t.TextMuted)
-						ui.Text(c, "暂无同步活动日志，启动同步或扫描文件夹后将实时滚动显示。").TextColor(t.TextMuted)
-					})
+					app.emptyState(c, t, IconActivity, "暂无同步活动，启动同步或扫描文件夹后会实时显示。", "", nil)
 					return
 				}
 				app.syncLogList.FollowEnd = true
@@ -963,17 +1101,15 @@ func (app *App) buildLogsPage(c *ui.Context, t *ui.Theme) {
 				ui.List(c, &app.syncLogList, len(syncLogs), func(i int) {
 					entry := syncLogs[i]
 					ui.Row(c).Padding(t.Space(1.5), t.Space(3)).Gap(t.Space(2)).Children(func() {
-						ui.Text(c, entry.Time.Format("15:04:05.000")).TextColor(t.TextMuted)
-						ui.Badge(c, entry.Level).Background(app.logLevelColor(t, entry.Level).Alpha(0.16)).TextColor(app.logLevelColor(t, entry.Level))
+						ui.Text(c, entry.Time.Format("15:04:05.000")).TextColor(t.TextMuted).FontSize(t.Rem(0.8))
+						ui.Badge(c, entry.Level).Background(app.logLevelColor(t, entry.Level).Alpha(0.14)).
+							TextColor(app.logLevelColor(t, entry.Level))
 						ui.Text(c, entry.Message).Grow(1)
 					})
 				}).Grow(1)
 			} else {
 				if len(tunLogs) == 0 {
-					ui.Column(c).Fill().Center().Gap(t.Space(2)).Padding(t.Space(6)).Children(func() {
-						ui.Icon(c, IconCloud).TextColor(t.TextMuted)
-						ui.Text(c, "暂无 Cloudflared 隧道输出，在主机模式下启动隧道后将实时显示。").TextColor(t.TextMuted)
-					})
+					app.emptyState(c, t, IconCloud, "暂无 Cloudflared 隧道输出，在主机模式下启动隧道后会显示。", "", nil)
 					return
 				}
 				app.tunnelLogList.FollowEnd = true
@@ -988,249 +1124,411 @@ func (app *App) buildLogsPage(c *ui.Context, t *ui.Theme) {
 
 func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 	ui.Scroll(c.Key("settings-scroll")).Fill().Children(func() {
-		ui.Column(c).Padding(t.Space(4)).Gap(t.Space(4)).Children(func() {
-			ui.Column(c).Padding(t.Space(4)).Gap(t.Space(3)).Radius(t.Radius).
-				Background(t.Surface).Border(1, t.Border).Children(func() {
-				ui.Row(c).Gap(t.Space(2)).Children(func() {
-					ui.Icon(c, IconSettings).TextColor(t.Accent)
-					ui.Text(c, "忽略规则、冲突处理与 Windows 11 便携设置").FontSize(t.Rem(1.05)).Bold().Grow(1)
-					if ui.Button(c.Key("btn-reset-defaults"), "恢复默认设置").Clicked() {
-						app.confirmResetCfgOpen = true
-					}
+		ui.Column(c).Padding(t.Space(5)).Gap(t.Space(3)).Children(func() {
+			ui.Row(c).AlignItems(ui.End).Children(func() {
+				ui.Column(c).Gap(t.Space(0.5)).Grow(1).Children(func() {
+					ui.Text(c, "设置").FontSize(t.Rem(1.2)).Bold()
+					ui.Text(c, "所有配置与索引都保存在程序同级的 data 目录，不写入注册表或其他用户目录。").
+						TextColor(t.TextMuted).FontSize(t.Rem(0.82))
 				})
+				if ui.Button(c.Key("btn-reset-defaults"), "恢复默认设置").Clicked() {
+					app.confirmResetCfgOpen = true
+				}
+			})
 
-				ui.Divider(c)
-
+			app.settingsSection(c, t, "文件夹与方向", &app.settingsFoldersOpen, func() {
 				ui.Form(c, func() {
-					ui.Fieldset(c, "文件过滤与冲突保护策略", func() {
-						ui.Field(c, "忽略规则列表", func() {
-							if ui.TokenField(c.Key("token-ignore"), &app.cfg.IgnorePatterns, config.PresetIgnoreSuggestions()).
-								Placeholder("输入通配符 (如 *.tmp, .git) 按回车添加…").
-								Label("忽略规则列表").
-								Changed() {
+					var dirErr string
+					if strings.TrimSpace(app.cfg.SyncDir) == "" {
+						dirErr = "请选择或输入需要实时同步的本地文件夹路径"
+					}
+					ui.Field(c, "主同步目录", func() {
+						ui.Row(c).Gap(t.Space(2)).Children(func() {
+							if ui.TextInput(c.Key("input-sync-dir"), &app.cfg.SyncDir).Placeholder(`例如 D:\Work\SharedFolder`).Grow(1).Changed() {
+								if len(app.cfg.SyncFolders) > 0 {
+									app.cfg.SyncFolders[0].LocalPath = app.cfg.SyncDir
+								}
+								app.saveConfig()
+							}
+							if ui.Button(c.Key("btn-browse-dir"), "浏览…").Clicked() {
+								app.pickSyncDirectory(c)
+							}
+						})
+					}).Description("也可以把文件从资源管理器直接拖进 SyncT 窗口导入这里").Error(dirErr)
+
+					dirIdx := syncDirectionIndex(app.cfg.SyncDirection)
+					ui.Field(c, "同步方向", func() {
+						choice := syncDirOptions[dirIdx]
+						if ui.Select(c.Key("sel-sync-dir"), &choice, syncDirOptions).Label("同步方向").Changed() {
+							app.cfg.SyncDirection = parseSyncDirection(choice)
+							app.saveConfig()
+							app.engine.UpdateConfig(app.cfg)
+							c.Toast("同步方向已更新为: " + choice)
+						}
+					}).Description("双向模式会比较修改时间与 SHA-256；冲突时按下面的规则处理")
+				})
+			})
+
+			app.settingsSection(c, t, "工作模式与连接", &app.settingsConnOpen, func() {
+				ui.Form(c, func() {
+					ui.Field(c, "工作模式", func() {
+						if ui.Segmented(c.Key("seg-role"), &app.roleIndex, "主机模式 (发布隧道)", "节点模式 (连接远端)").Changed() {
+							running := app.engine.IsRunning()
+							if running {
+								app.StopAll()
+							}
+							app.syncFieldsToConfig()
+							app.saveConfig()
+							app.engine.UpdateConfig(app.cfg)
+							if app.cfg.Role == config.RoleHost {
+								c.Toast("已切换为主机模式：由本机发布 Cloudflared 隧道")
+							} else {
+								c.Toast("已切换为节点模式：连接远端 Cloudflared 隧道")
+							}
+						}
+					}).Description("主机模式监听本地端口并复用系统 Cloudflared；节点模式只发起出站 HTTPS，不监听端口")
+
+					ui.Field(c, "访问密钥", func() {
+						ui.Row(c).Gap(t.Space(2)).Children(func() {
+							inp := ui.TextInput(c.Key("input-auth-token"), &app.cfg.AuthToken).Placeholder("两端必须一致的访问密钥").Grow(1)
+							if !app.showToken {
+								inp.Password()
+							}
+							ui.Toggle(c.Key("toggle-show-token"), &app.showToken, "显示")
+							if ui.Button(c.Key("btn-gen-token"), "随机生成").Clicked() {
+								app.cfg.AuthToken = config.GenerateToken()
 								app.saveConfig()
 								app.engine.UpdateConfig(app.cfg)
-								c.Toast("已更新忽略规则并重新过滤文件")
+								c.Toast("已生成新的随机访问密钥")
 							}
-						}).Description("匹配的文件夹或文件名将不会被扫描、上传或下载 (.synct* 临时文件始终自动忽略)")
+						})
+					}).Description("两端使用相同的 X-SyncT-Token 才能读写同步文件")
 
-						confIdx := conflictPolicyIndex(app.cfg.ConflictPolicy)
-						ui.Field(c, "版本冲突策略", func() {
-							choice := conflictOptions[confIdx]
-							if ui.Select(c.Key("sel-conflict-policy"), &choice, conflictOptions).Label("版本冲突策略").Changed() {
-								app.cfg.ConflictPolicy = parseConflictPolicy(choice)
+					if app.roleIndex == 0 {
+						tmIdx := tunnelModeIndex(app.cfg.TunnelMode)
+						ui.Field(c, "隧道方式", func() {
+							choice := tunnelModeOptions[tmIdx]
+							if ui.Select(c.Key("sel-tunnel-mode"), &choice, tunnelModeOptions).Label("隧道方式").Changed() {
+								app.cfg.TunnelMode = parseTunnelMode(choice)
 								app.saveConfig()
-								app.engine.UpdateConfig(app.cfg)
-								c.Toast("冲突策略已更新: " + choice)
+								c.Toast("已切换隧道方式: " + choice)
 							}
-						}).Description("当两端同时修改同一文件时，保留冲突副本可确保任何一端的改动都不会丢失")
+						}).Description("默认复用本机已运行的系统 Cloudflared，无需再次启动进程或填写 Token")
 
-						ui.Field(c, "同步文件删除", func() {
-							if ui.Switch(c.Key("sw-sync-del"), &app.cfg.SyncDeletions).Label("同步文件删除").Changed() {
-								app.saveConfig()
-								app.engine.UpdateConfig(app.cfg)
-								c.Toast("已更新文件删除同步开关")
-							}
-						}).Description("开启后，一端删除文件会产生删除墓碑 (Tombstone) 并同步移除另一端的对应文件")
-					})
-
-					ui.Fieldset(c, "Windows 11 便携版运行行为", func() {
-						ui.Field(c, "Cloudflared 路径", func() {
-							ui.Row(c).Gap(t.Space(2)).Children(func() {
-								if ui.TextInput(c.Key("input-cf-path"), &app.cfg.CloudflaredPath).
-									Placeholder("留空则自动按 ./bin/cloudflared.exe -> 系统 PATH 顺序查找").
-									Grow(1).Changed() {
+						if app.cfg.TunnelMode == config.TunnelSystem || app.cfg.TunnelMode == config.TunnelToken {
+							ui.Field(c, "公网域名", func() {
+								if ui.TextInput(c.Key("input-custom-pub-url"), &app.cfg.CustomPublicURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
 									app.saveConfig()
-									// Probe asynchronously and debounced: `cloudflared --version`
-									// can take seconds and must never block the UI thread.
-									app.scheduleBinaryRefresh()
+								}
+							}).Description("Cloudflared 入站规则绑定的域名")
+						}
+						if app.cfg.TunnelMode == config.TunnelToken {
+							ui.Field(c, "Tunnel Token", func() {
+								ui.TextInput(c.Key("input-tunnel-token"), &app.cfg.TunnelToken).Placeholder("eyJhIjoi... (Cloudflare Zero Trust 隧道 Token)").Password()
+							}).Description("在 Cloudflare Zero Trust 控制台创建的固定隧道 Token")
+						}
+
+						var portErr string
+						if p, err := strconv.Atoi(strings.TrimSpace(app.portInput)); err != nil || p <= 0 || p > 65535 {
+							portErr = "请输入 1 ~ 65535 之间的有效端口号"
+						}
+						ui.Field(c, "本地端口", func() {
+							ui.Row(c).Gap(t.Space(2)).Children(func() {
+								if ui.TextInput(c.Key("input-local-port"), &app.portInput).Placeholder("18920").Grow(1).Changed() {
+									app.syncFieldsToConfig()
+									app.saveConfig()
+								}
+								ui.Badge(c, fmt.Sprintf("localhost:%s", strings.TrimSpace(app.portInput))).
+									Background(t.Accent.Alpha(0.12)).TextColor(t.Accent)
+							})
+						}).Description("只绑定 127.0.0.1 / ::1；内建自签名 TLS，同时兼容 HTTPS 与 HTTP").Error(portErr)
+					} else {
+						ui.Field(c, "一键连接码", func() {
+							ui.Row(c).Gap(t.Space(2)).Children(func() {
+								ui.TextInput(c.Key("input-share-code"), &app.shareInput).
+									Placeholder("粘贴 synct://connect/... 或 st_... 密钥").Grow(1)
+								if ui.Button(c.Key("btn-paste-code"), "从剪贴板粘贴").Clicked() {
+									if app.win != nil {
+										clip := strings.TrimSpace(mygo.Clipboard.ReadText())
+										if clip != "" {
+											app.shareInput = clip
+										}
+									}
+									app.applyShareCodeInput(c)
+								}
+								if ui.Button(c.Key("btn-parse-code"), "解析填充").Disabled(strings.TrimSpace(app.shareInput) == "").Clicked() {
+									app.applyShareCodeInput(c)
 								}
 							})
-						}).Description("便携移动使用时可将 cloudflared.exe 放在软件同级的 bin 目录中")
+						}).Description("在主机端点击「复制连接码」，然后在这里导入域名与访问密钥")
 
-						ui.Field(c, "自动启动同步", func() {
-							if ui.Switch(c.Key("sw-autostart"), &app.cfg.AutoStartSync).Label("自动启动同步").Changed() {
+						var remoteErr string
+						if strings.TrimSpace(app.cfg.RemoteURL) == "" {
+							remoteErr = "请填写 Cloudflared 隧道域名"
+						}
+						ui.Field(c, "远端地址", func() {
+							if ui.TextInput(c.Key("input-remote-url"), &app.cfg.RemoteURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
 								app.saveConfig()
-								c.Toast("已保存自动启动同步选项")
+								app.engine.UpdateConfig(app.cfg)
 							}
-						}).Description("打开 SyncT.exe 时立即按照上次保存的配置启动隧道与实时同步（主机端默认开启，避免浏览器打开时源站尚未监听而返回 502）")
+						}).Description("工作电脑只通过标准 HTTPS (443) 出站连接这个地址").Error(remoteErr)
+					}
+				})
+			})
 
-						ui.Field(c, "开机自动运行", func() {
-							if ui.Switch(c.Key("sw-openatlogin"), &app.cfg.OpenAtLogin).Label("登录 Windows 后自动启动").Changed() {
-								app.saveConfig()
-								if app.win != nil {
-									if err := mygo.App.SetOpenAtLogin(app.cfg.OpenAtLogin); err != nil {
-										c.Toast("设置开机自启失败: " + err.Error())
-									} else {
-										c.Toast("已更新 Windows 登录自启动设置")
-									}
+			app.settingsSection(c, t, "文件规则", &app.settingsRulesOpen, func() {
+				ui.Form(c, func() {
+					ui.Field(c, "忽略规则", func() {
+						if ui.TokenField(c.Key("token-ignore"), &app.cfg.IgnorePatterns, config.PresetIgnoreSuggestions()).
+							Placeholder("输入通配符 (如 *.tmp, .git) 后回车…").
+							Label("忽略规则列表").
+							Changed() {
+							app.saveConfig()
+							app.engine.UpdateConfig(app.cfg)
+							c.Toast("已更新忽略规则")
+						}
+					}).Description("匹配的文件夹或文件不会被扫描、上传或下载；.synct* 临时文件始终忽略")
+
+					confIdx := conflictPolicyIndex(app.cfg.ConflictPolicy)
+					ui.Field(c, "冲突策略", func() {
+						choice := conflictOptions[confIdx]
+						if ui.Select(c.Key("sel-conflict-policy"), &choice, conflictOptions).Label("冲突策略").Changed() {
+							app.cfg.ConflictPolicy = parseConflictPolicy(choice)
+							app.saveConfig()
+							app.engine.UpdateConfig(app.cfg)
+							c.Toast("冲突策略已更新: " + choice)
+						}
+					}).Description("保留副本会生成 .conflict-时间戳 文件，任何一端的改动都不会丢失")
+
+					ui.Field(c, "同步删除", func() {
+						if ui.Switch(c.Key("sw-sync-del"), &app.cfg.SyncDeletions).Label("同步删除").Changed() {
+							app.saveConfig()
+							app.engine.UpdateConfig(app.cfg)
+							c.Toast("已更新文件删除同步开关")
+						}
+					}).Description("一端删除文件后，对端对应的文件也会被移除（保留 30 天删除记录用于离线对账）")
+				})
+			})
+
+			app.settingsSection(c, t, "运行与后台", &app.settingsRuntimeOpen, func() {
+				ui.Form(c, func() {
+					ui.Field(c, "自动启动同步", func() {
+						if ui.Switch(c.Key("sw-autostart"), &app.cfg.AutoStartSync).Label("自动启动同步").Changed() {
+							app.saveConfig()
+							c.Toast("已保存自动启动同步选项")
+						}
+					}).Description("打开 SyncT 后立即按上次配置启动隧道与实时同步")
+
+					ui.Field(c, "开机自动运行", func() {
+						if ui.Switch(c.Key("sw-openatlogin"), &app.cfg.OpenAtLogin).Label("登录 Windows 后自动启动").Changed() {
+							app.saveConfig()
+							if app.win != nil {
+								if err := mygo.App.SetOpenAtLogin(app.cfg.OpenAtLogin); err != nil {
+									c.Toast("设置开机自启失败: " + err.Error())
+								} else {
+									c.Toast("已更新 Windows 登录自启动设置")
 								}
 							}
-						}).Description("通过当前用户登录项启动（无需管理员权限，可在任务管理器禁用）")
+						}
+					}).Description("通过当前用户登录项启动，无需管理员权限")
 
-						ui.Field(c, "防止系统休眠", func() {
-							if ui.Switch(c.Key("sw-keepawake"), &app.cfg.KeepAwake).Label("防止系统休眠").Changed() {
-								app.saveConfig()
-								app.updateKeepAwake(app.engine.IsRunning())
-								c.Toast("已更新电源唤醒保持策略")
-							}
-						}).Description("同步运行期间调用 Windows 电源服务防止电脑睡眠中断公网隧道")
+					ui.Field(c, "防止系统休眠", func() {
+						if ui.Switch(c.Key("sw-keepawake"), &app.cfg.KeepAwake).Label("防止系统休眠").Changed() {
+							app.saveConfig()
+							app.updateKeepAwake(app.engine.IsRunning())
+							c.Toast("已更新电源保持策略")
+						}
+					}).Description("同步运行期间阻止系统睡眠，避免公网隧道中断")
 
-						ui.Field(c, "最小化到托盘", func() {
-							if ui.Switch(c.Key("sw-tray"), &app.cfg.MinimizeToTray).Label("最小化到托盘").Changed() {
-								app.saveConfig()
-								c.Toast("已更新关闭窗口最小化至系统托盘设置")
-							}
-						}).Description("点击窗口关闭按钮时隐藏到 Windows 11 右下角系统托盘继续后台实时同步")
+					ui.Field(c, "最小化到托盘", func() {
+						if ui.Switch(c.Key("sw-tray"), &app.cfg.MinimizeToTray).Label("最小化到托盘").Changed() {
+							app.saveConfig()
+							c.Toast("已更新关闭窗口时的后台运行设置")
+						}
+					}).Description("关闭窗口时隐藏到系统托盘并继续同步")
 
-						ui.Field(c, "User 权限克制模式", func() {
-							if ui.Switch(c.Key("sw-lowpriv"), &app.cfg.LowPrivilegeMode).Label("User 权限克制模式").Changed() {
-								app.saveConfig()
-								c.Toast("已更新 User 权限克制模式策略")
+					ui.Field(c, "后台提示", func() {
+						if ui.Switch(c.Key("sw-tray-notice"), &app.cfg.TrayCloseNotice).Label("关闭窗口时提示").Changed() {
+							app.saveConfig()
+							if app.cfg.TrayCloseNotice {
+								c.Toast("已开启：关闭窗口时在通知中心提示仍在后台同步")
+							} else {
+								c.Toast("已关闭：关闭窗口后静默在后台同步")
 							}
-						}).Description("专为受限 User 权限工作电脑设计：强制 asInvoker 权限清单、仅绑定回环地址、窗口状态与缓存全部隔离在 ./data/ 目录")
-					})
+						}
+					}).Description("只在最小化到托盘时显示一条系统通知，不影响同步本身")
+
+					ui.Field(c, "用户权限克制", func() {
+						if ui.Switch(c.Key("sw-lowpriv"), &app.cfg.LowPrivilegeMode).Label("用户权限克制模式").Changed() {
+							app.saveConfig()
+							c.Toast("已更新用户权限克制模式")
+						}
+					}).Description("强制 asInvoker 清单、只绑定回环地址，数据全部隔离在 ./data/")
 				})
+			})
 
-				ui.Divider(c)
-				ui.Column(c).Gap(t.Space(1)).Children(func() {
-					ui.Textf(c, "便携数据目录: %s", config.DataDir()).TextColor(t.TextMuted)
-					ui.Textf(c, "便携配置文件: %s", config.ConfigPath()).TextColor(t.TextMuted)
-					ui.Textf(c, "同步状态索引: %s", config.StatePath()).TextColor(t.TextMuted)
-				})
+			app.settingsSection(c, t, "多文件夹与跨机映射", &app.settingsAdvancedOpen, func() {
+				app.buildFolderMappingsFields(c, t)
+			})
+
+			ui.Column(c).Gap(t.Space(0.5)).Children(func() {
+				ui.Textf(c, "数据目录  %s", config.DataDir()).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
+				ui.Textf(c, "配置  %s", config.ConfigPath()).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
+				ui.Textf(c, "索引  %s", config.StatePath()).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
 			})
 		})
 	})
 }
 
-func (app *App) buildStatusBar(c *ui.Context, t *ui.Theme) {
-	stats := app.engine.Stats()
-	tunState, pubURL, lanURL, _ := app.tunnel.State()
-
-	ui.Row(c).Padding(t.Space(1.5), t.Space(3)).Gap(t.Space(3)).Background(t.Surface).Children(func() {
-		ui.Badge(c, string(stats.State)).Background(app.stateColor(t, stats.State).Alpha(0.18)).TextColor(app.stateColor(t, stats.State))
-		ui.Textf(c, "↑ %s  ↓ %s", syncer.FormatSpeed(stats.UploadSpeed), syncer.FormatSpeed(stats.DownloadSpeed)).TextColor(t.Accent).Bold().SingleLine()
-		ui.Textf(c, "文件: %d 个 (%s) · %d 个映射目录", stats.TotalFiles, syncer.FormatBytes(stats.TotalBytes), max(stats.FolderCount, 1)).TextColor(t.Text).SingleLine()
-		ui.Textf(c, "主目录: %s", app.cfg.SyncDir).TextColor(t.TextMuted).SingleLine().Grow(1)
-
-		if pubURL != "" {
-			ui.Textf(c, "公网隧道: %s", pubURL).TextColor(t.Accent).SingleLine()
-		} else if lanURL != "" {
-			ui.Textf(c, "本地地址: %s", lanURL).TextColor(t.TextMuted).SingleLine()
-		} else {
-			ui.Textf(c, "隧道: %s", tunState).TextColor(t.TextMuted).SingleLine()
-		}
-
-		if !stats.LastSyncTime.IsZero() {
-			ui.Textf(c, "最近同步: %s", stats.LastSyncTime.Format("15:04:05")).TextColor(t.TextMuted)
-		}
-	})
-}
-
-func (app *App) buildStatCard(c *ui.Context, t *ui.Theme, title, value, sub string, accentColor ui.Color) {
-	ui.Column(c).Padding(t.Space(3)).Gap(t.Space(1)).Radius(t.Radius).
+func (app *App) settingsSection(c *ui.Context, t *ui.Theme, title string, open *bool, body func()) {
+	ui.Column(c).FillWidth().Padding(t.Space(3.5)).Radius(t.Radius).
 		Background(t.Surface).Border(1, t.Border).Children(func() {
-		ui.Text(c, title).TextColor(t.TextMuted)
-		ui.Text(c, value).FontSize(t.Rem(1.15)).Bold().TextColor(accentColor).SingleLine()
-		ui.Text(c, sub).TextColor(t.TextMuted).SingleLine()
+		ui.Collapsible(c, title, open, body)
 	})
 }
 
-func (app *App) buildFolderMappingsSection(c *ui.Context, t *ui.Theme) {
-	ui.Fieldset(c, "多文件夹同步与跨机目录映射 (本机文件夹 <-> 另一台电脑目标文件夹)", func() {
-		ui.Text(c, "支持同时同步多个独立文件夹，并可指定本机文件夹在另一台电脑上对应的目标文件夹路径（对端连接时将按映射标识自动创建或绑定目标目录）。").
-			TextColor(t.TextMuted)
+func (app *App) buildStatusBar(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
+	tunState, pubURL, lanURL, _ := app.tunnel.State()
+	url := app.activeShareURL(stats, pubURL, lanURL)
+	if url == "" {
+		url = string(tunState)
+	}
 
-		removeID := ""
-		changed := false
+	ui.Row(c).Padding(t.Space(1.25), t.Space(3)).Gap(t.Space(2.5)).Background(t.Surface).Children(func() {
+		ui.Box(c).Size(t.Space(1.5), t.Space(1.5)).Radius(t.Space(0.75)).
+			Background(app.stateColor(t, stats.State)).Margin(0, t.Space(0.5), 0, 0)
+		ui.Text(c, string(stats.State)).TextColor(app.stateColor(t, stats.State)).Bold().SingleLine()
 
-		for i := range app.cfg.SyncFolders {
-			idx := i
-			folder := &app.cfg.SyncFolders[idx]
-			isDefault := config.NormalizeFolderID(folder.ID) == config.DefaultFolderID
+		ui.Textf(c, "↑ %s", syncer.FormatSpeed(stats.UploadSpeed)).TextColor(t.Accent).SingleLine()
+		ui.Textf(c, "↓ %s", syncer.FormatSpeed(stats.DownloadSpeed)).TextColor(transferAccent).SingleLine()
 
-			ui.Column(c).Key(fmt.Sprintf("folder-map-%d", idx)).Padding(t.Space(2.5)).Gap(t.Space(2)).
-				Radius(t.Radius).Background(t.Background).Border(1, t.Border).Children(func() {
-				ui.Row(c).Gap(t.Space(2)).Children(func() {
-					if ui.Switch(c.Key(fmt.Sprintf("sw-f-en-%d", idx)), &folder.Enabled).Label("启用").Changed() {
-						changed = true
-					}
-					ui.Badge(c, "ID: "+folder.ID).Background(t.Accent.Alpha(0.15)).TextColor(t.Accent)
-					if ui.TextInput(c.Key(fmt.Sprintf("inp-f-lbl-%d", idx)), &folder.Label).Placeholder("目录显示名称").Grow(1).Changed() {
-						changed = true
-					}
-					if ui.Button(c.Key(fmt.Sprintf("btn-f-open-%d", idx)), "打开目录").Clicked() {
-						if app.win != nil && strings.TrimSpace(folder.LocalPath) != "" {
-							go mygo.Shell.OpenPath(folder.LocalPath)
-						}
-					}
-					if !isDefault {
-						if ui.Button(c.Key(fmt.Sprintf("btn-f-del-%d", idx)), "移除").Clicked() {
-							removeID = folder.ID
-						}
-					}
-				})
-
-				ui.Row(c).Gap(t.Space(2)).Children(func() {
-					ui.Text(c, "本机目录:").TextColor(t.TextMuted)
-					if ui.TextInput(c.Key(fmt.Sprintf("inp-f-loc-%d", idx)), &folder.LocalPath).
-						Placeholder("本机要同步的文件夹路径，例如 D:\\Projects\\Docs").Grow(1).Changed() {
-						if isDefault {
-							app.cfg.SyncDir = folder.LocalPath
-						}
-						changed = true
-					}
-					if ui.Button(c.Key(fmt.Sprintf("btn-f-browse-%d", idx)), "浏览…").Clicked() {
-						curPath := folder.LocalPath
-						app.pickFolderWithCallback(c, curPath, func(chosen string) {
-							if idx < len(app.cfg.SyncFolders) {
-								app.cfg.SyncFolders[idx].LocalPath = chosen
-								if isDefault {
-									app.cfg.SyncDir = chosen
-								}
-								app.saveConfig()
-								app.engine.UpdateConfig(app.cfg)
-							}
-						})
-					}
-				})
-
-				ui.Row(c).Gap(t.Space(2)).Children(func() {
-					ui.Text(c, "对端映射:").TextColor(t.TextMuted)
-					if ui.TextInput(c.Key(fmt.Sprintf("inp-f-rem-%d", idx)), &folder.RemotePath).
-						Placeholder("映射至另一台电脑的目标文件夹路径 (例如 C:\\Users\\Work\\Desktop\\Docs，留空则由对端指定)").Grow(1).Changed() {
-						changed = true
-					}
-				})
-			})
+		if stats.UnsyncedFiles > 0 {
+			ui.Textf(c, "未同步 %d", stats.UnsyncedFiles).TextColor(t.Warning).SingleLine()
+		} else {
+			ui.Text(c, "已全部同步").TextColor(t.TextMuted).SingleLine()
 		}
 
-		if removeID != "" {
-			app.cfg.RemoveFolder(removeID)
-			changed = true
-			c.Toast("已移除同步文件夹映射: " + removeID)
-		}
+		ui.Textf(c, "%d 文件 · %d 文件夹 · %s", stats.TotalFiles, stats.TotalDirs, syncer.FormatBytes(stats.TotalBytes)).
+			TextColor(t.TextMuted).SingleLine()
 
-		if changed {
-			app.cfg.Normalize()
+		ui.Spacer(c)
+
+		ui.Text(c, url).TextColor(t.TextMuted).SingleLine().MaxWidth(t.Space(44))
+
+		if ui.Toggle(c.Key("toggle-tray-notice"), &app.cfg.TrayCloseNotice, "后台提示").
+			Tooltip("关闭主窗口时是否在通知中心提示 SyncT 仍在后台同步").
+			Label("关闭窗口时显示后台提示").
+			Changed() {
+			app.statusBarNoticeSeen = app.cfg.TrayCloseNotice
 			app.saveConfig()
-			app.engine.UpdateConfig(app.cfg)
+			c.Toast(app.trayNoticeToast(app.cfg.TrayCloseNotice))
+		} else if app.cfg.TrayCloseNotice != app.statusBarNoticeSeen {
+			// The settings page owns this same value; adopt its change without
+			// raising a second toast for one action.
+			app.statusBarNoticeSeen = app.cfg.TrayCloseNotice
 		}
+	})
+}
 
-		// Add new mapped folder card
-		ui.Column(c).Padding(t.Space(2.5)).Gap(t.Space(2)).Radius(t.Radius).
-			Background(t.Surface).Border(1, t.Border).Children(func() {
-			ui.Text(c, "新增同步文件夹 / 跨电脑文件夹映射").Bold()
+func (app *App) trayNoticeToast(on bool) string {
+	if on {
+		return "已开启：关闭窗口时在通知中心提示 SyncT 仍在后台同步"
+	}
+	return "已关闭：关闭窗口后静默在后台同步"
+}
+
+func (app *App) buildFolderMappingsFields(c *ui.Context, t *ui.Theme) {
+	ui.Text(c, "除主目录外，还可以同步任意数量的独立文件夹，并指定它在本机与另一台电脑上的对应路径。").
+		TextColor(t.TextMuted).FontSize(t.Rem(0.82))
+
+	removeID := ""
+	changed := false
+
+	for i := range app.cfg.SyncFolders {
+		idx := i
+		folder := &app.cfg.SyncFolders[idx]
+		isDefault := config.NormalizeFolderID(folder.ID) == config.DefaultFolderID
+
+		ui.Column(c).Key(fmt.Sprintf("folder-map-%d", idx)).Padding(t.Space(2.5)).Gap(t.Space(2)).
+			Radius(t.Radius).Background(t.Background).Border(1, t.Border).Children(func() {
+			ui.Row(c).Gap(t.Space(2)).Children(func() {
+				if ui.Switch(c.Key(fmt.Sprintf("sw-f-en-%d", idx)), &folder.Enabled).Label("启用").Changed() {
+					changed = true
+				}
+				ui.Badge(c, "ID: "+folder.ID).Background(t.Accent.Alpha(0.12)).TextColor(t.Accent)
+				if ui.TextInput(c.Key(fmt.Sprintf("inp-f-lbl-%d", idx)), &folder.Label).Placeholder("目录显示名称").Grow(1).Changed() {
+					changed = true
+				}
+				if ui.Button(c.Key(fmt.Sprintf("btn-f-open-%d", idx)), "打开").Clicked() {
+					if strings.TrimSpace(folder.LocalPath) != "" {
+						app.openPath(folder.LocalPath)
+					}
+				}
+				if !isDefault {
+					if ui.Button(c.Key(fmt.Sprintf("btn-f-del-%d", idx)), "移除").Clicked() {
+						removeID = folder.ID
+					}
+				}
+			})
+
+			ui.Row(c).Gap(t.Space(2)).Children(func() {
+				ui.Text(c, "本机").TextColor(t.TextMuted).Width(t.Space(8))
+				if ui.TextInput(c.Key(fmt.Sprintf("inp-f-loc-%d", idx)), &folder.LocalPath).
+					Placeholder(`本机文件夹路径，例如 D:\Projects\Docs`).Grow(1).Changed() {
+					if isDefault {
+						app.cfg.SyncDir = folder.LocalPath
+					}
+					changed = true
+				}
+				if ui.Button(c.Key(fmt.Sprintf("btn-f-browse-%d", idx)), "浏览…").Clicked() {
+					curPath := folder.LocalPath
+					app.pickFolderWithCallback(c, curPath, func(chosen string) {
+						if idx < len(app.cfg.SyncFolders) {
+							app.cfg.SyncFolders[idx].LocalPath = chosen
+							if isDefault {
+								app.cfg.SyncDir = chosen
+							}
+							app.saveConfig()
+							app.engine.UpdateConfig(app.cfg)
+						}
+					})
+				}
+			})
+
+			ui.Row(c).Gap(t.Space(2)).Children(func() {
+				ui.Text(c, "对端").TextColor(t.TextMuted).Width(t.Space(8))
+				if ui.TextInput(c.Key(fmt.Sprintf("inp-f-rem-%d", idx)), &folder.RemotePath).
+					Placeholder("映射至另一台电脑的目标文件夹，留空则由对端决定").Grow(1).Changed() {
+					changed = true
+				}
+			})
+		})
+	}
+
+	if removeID != "" {
+		app.cfg.RemoveFolder(removeID)
+		changed = true
+		c.Toast("已移除同步文件夹映射: " + removeID)
+	}
+
+	if changed {
+		app.cfg.Normalize()
+		app.saveConfig()
+		app.engine.UpdateConfig(app.cfg)
+	}
+
+	ui.Collapsible(c, "添加同步文件夹", &app.addFolderOpen, func() {
+		ui.Column(c).Gap(t.Space(2)).Children(func() {
 			ui.Row(c).Gap(t.Space(2)).Children(func() {
 				ui.TextInput(c.Key("inp-new-f-id"), &app.newFolderID).
-					Placeholder("映射标识 ID (如 projects, reports，可留空自动生成)").Grow(1)
+					Placeholder("映射 ID (可留空自动生成)").Grow(1)
 				ui.TextInput(c.Key("inp-new-f-lbl"), &app.newFolderLabel).
-					Placeholder("显示名称 (如 工作项目文档)").Grow(1)
+					Placeholder("显示名称").Grow(1)
 			})
 			ui.Row(c).Gap(t.Space(2)).Children(func() {
 				ui.TextInput(c.Key("inp-new-f-loc"), &app.newFolderLocal).
-					Placeholder("本机文件夹路径 (例如 D:\\Code\\MyNotes)").Grow(1)
-				if ui.Button(c.Key("btn-new-f-browse"), "选择本机目录…").Clicked() {
+					Placeholder(`本机文件夹路径，例如 D:\Code\MyNotes`).Grow(1)
+				if ui.Button(c.Key("btn-new-f-browse"), "选择…").Clicked() {
 					app.pickFolderWithCallback(c, app.newFolderLocal, func(chosen string) {
 						app.newFolderLocal = chosen
 						if strings.TrimSpace(app.newFolderLabel) == "" {
@@ -1244,8 +1542,8 @@ func (app *App) buildFolderMappingsSection(c *ui.Context, t *ui.Theme) {
 			})
 			ui.Row(c).Gap(t.Space(2)).Children(func() {
 				ui.TextInput(c.Key("inp-new-f-rem"), &app.newFolderRemote).
-					Placeholder("另一台电脑的目标文件夹路径 (选填，例如 C:\\Users\\WorkUser\\Documents\\Notes)").Grow(1)
-				if ui.Button(c.Key("btn-add-folder-map"), "添加文件夹映射").
+					Placeholder("另一台电脑的目标文件夹（选填）").Grow(1)
+				if ui.Button(c.Key("btn-add-folder-map"), "添加").
 					Disabled(strings.TrimSpace(app.newFolderLocal) == "").Clicked() {
 					id := config.NormalizeFolderID(app.newFolderID)
 					if app.newFolderID == "" || id == config.DefaultFolderID {
@@ -1346,6 +1644,54 @@ func (app *App) applyShareCodeInput(c *ui.Context) {
 	c.Toast("已成功导入隧道地址与访问密钥")
 }
 
+// copyShareCode encodes the current public/local endpoint into a synct:// code.
+func (app *App) copyShareCode(c *ui.Context) {
+	stats := app.engine.Stats()
+	_, pubURL, lanURL, _ := app.tunnel.State()
+	activeURL := app.activeShareURL(stats, pubURL, lanURL)
+	shareCode := config.EncodeShareCode(activeURL, app.cfg.AuthToken)
+	if activeURL == "" && stats.LocalPort > 0 {
+		activeURL = fmt.Sprintf("https://localhost:%d", stats.LocalPort)
+		shareCode = config.EncodeShareCode(activeURL, app.cfg.AuthToken)
+	}
+	if shareCode == "" {
+		c.Toast("请先启动隧道或填写远端地址后再复制连接码")
+		return
+	}
+	app.writeClipboard(shareCode)
+	c.Toast("已复制 synct:// 一键连接码 (" + activeURL + ")")
+}
+
+func (app *App) activeShareURL(stats syncer.Stats, pubURL, lanURL string) string {
+	activeURL := pubURL
+	if activeURL == "" && app.cfg.CustomPublicURL != "" {
+		activeURL = app.cfg.CustomPublicURL
+	}
+	if activeURL == "" {
+		activeURL = lanURL
+	}
+	if app.cfg.Role == config.RoleClient && app.cfg.RemoteURL != "" {
+		activeURL = app.cfg.RemoteURL
+	}
+	if activeURL == "" && stats.LocalPort > 0 {
+		activeURL = fmt.Sprintf("https://localhost:%d", stats.LocalPort)
+	}
+	return activeURL
+}
+
+func (app *App) errorBannerText(stats syncer.Stats, tunErr string) string {
+	if stats.LastError != "" {
+		return stats.LastError
+	}
+	if stats.HealthWarning != "" {
+		return stats.HealthWarning
+	}
+	if stats.LastScanError != "" {
+		return stats.LastScanError
+	}
+	return tunErr
+}
+
 // scheduleBinaryRefresh debounces cloudflared version probes triggered by typing.
 func (app *App) scheduleBinaryRefresh() {
 	path := app.cfg.CloudflaredPath
@@ -1441,8 +1787,6 @@ func (app *App) filterAndSortFiles(files []syncer.FileEntry) []syncer.FileEntry 
 			less = out[i].Size < out[j].Size
 		case "mtime":
 			less = out[i].ModTime.Before(out[j].ModTime)
-		case "dir":
-			less = out[i].Direction < out[j].Direction
 		case "status":
 			less = out[i].Status < out[j].Status
 		default:
@@ -1454,6 +1798,38 @@ func (app *App) filterAndSortFiles(files []syncer.FileEntry) []syncer.FileEntry 
 		return less
 	})
 	return out
+}
+
+func pendingFiles(files []syncer.FileEntry) []syncer.FileEntry {
+	out := make([]syncer.FileEntry, 0, 16)
+	for _, f := range files {
+		if f.Status != syncer.StatusSynced {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func sortPending(files []syncer.FileEntry, order ui.SortOrder) {
+	sort.SliceStable(files, func(i, j int) bool {
+		var less bool
+		switch order.Column {
+		case "folder":
+			less = files[i].FolderLabel < files[j].FolderLabel
+		case "size":
+			less = files[i].Size < files[j].Size
+		case "mtime":
+			less = files[i].ModTime.Before(files[j].ModTime)
+		case "status":
+			less = files[i].Status < files[j].Status
+		default:
+			less = files[i].RelPath < files[j].RelPath
+		}
+		if order.Descending {
+			return !less
+		}
+		return less
+	})
 }
 
 func (app *App) formatCurrentLogsText(syncLogs []syncer.LogEntry, tunLogs []string) string {
@@ -1473,14 +1849,14 @@ func (app *App) formatCurrentLogsText(syncLogs []syncer.LogEntry, tunLogs []stri
 func (app *App) stateSubtext(stats syncer.Stats) string {
 	if app.cfg.Role == config.RoleHost {
 		if stats.LocalPort > 0 {
-			return fmt.Sprintf("监听 https://localhost:%d · 在线节点 %d", stats.LocalPort, stats.ConnectedPeers)
+			return fmt.Sprintf("监听 localhost:%d · 在线节点 %d", stats.LocalPort, stats.ConnectedPeers)
 		}
-		return "本机服务端 · 待启动 (https://localhost:18920)"
+		return "本机服务端 · 待启动"
 	}
 	if stats.RemoteConnected {
 		return "已连接远端主机 " + stats.RemoteNodeID
 	}
-	return "工作电脑客户端 (User低权限) · 待连接"
+	return "工作电脑客户端 · 待连接"
 }
 
 func (app *App) tunnelSubtext(pubURL, lanURL string) string {
@@ -1488,7 +1864,7 @@ func (app *App) tunnelSubtext(pubURL, lanURL string) string {
 		return pubURL
 	}
 	if app.cfg.Role == config.RoleHost && app.cfg.CustomPublicURL != "" {
-		return app.cfg.CustomPublicURL + " -> https://localhost:18920"
+		return app.cfg.CustomPublicURL + " → localhost:" + strconv.Itoa(app.cfg.LocalPort)
 	}
 	if lanURL != "" {
 		return lanURL
@@ -1499,7 +1875,7 @@ func (app *App) tunnelSubtext(pubURL, lanURL string) string {
 		}
 		return config.DefaultPublicURL
 	}
-	return "点击上方按钮启动隧道"
+	return "点击「开始同步」启动隧道"
 }
 
 func (app *App) stateColor(t *ui.Theme, st syncer.EngineState) ui.Color {
@@ -1573,13 +1949,13 @@ func tunnelModeIndex(m config.TunnelMode) int {
 
 func parseTunnelMode(label string) config.TunnelMode {
 	switch {
-	case strings.HasPrefix(label, "System"):
+	case strings.HasPrefix(label, "复用系统"), strings.HasPrefix(label, "System"):
 		return config.TunnelSystem
-	case strings.HasPrefix(label, "Token"):
+	case strings.HasPrefix(label, "托管"), strings.HasPrefix(label, "Token"):
 		return config.TunnelToken
-	case strings.HasPrefix(label, "Quick"):
+	case strings.HasPrefix(label, "临时"), strings.HasPrefix(label, "Quick"):
 		return config.TunnelQuick
-	case strings.HasPrefix(label, "LAN"):
+	case strings.HasPrefix(label, "仅局域网"), strings.HasPrefix(label, "LAN"):
 		return config.TunnelDirect
 	default:
 		return config.TunnelSystem
@@ -1616,7 +1992,7 @@ func conflictPolicyIndex(p config.ConflictPolicy) int {
 }
 
 func parseConflictPolicy(label string) config.ConflictPolicy {
-	if strings.HasPrefix(label, "最新修改") {
+	if strings.HasPrefix(label, "以最新") {
 		return config.ConflictNewerWins
 	}
 	return config.ConflictKeepBoth

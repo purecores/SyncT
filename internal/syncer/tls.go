@@ -44,6 +44,16 @@ func newSyncHTTPTransport() *http.Transport {
 			tr.TLSClientConfig.RootCAs = pool
 		}
 	}
+	// Transfers are bulk bytes over one tunnel; a handful of reused
+	// connections overlap latency between files without opening a new TLS
+	// handshake (and a new Cloudflare edge round trip) per file.
+	if tr.MaxIdleConnsPerHost < 8 {
+		tr.MaxIdleConnsPerHost = 8
+	}
+	if tr.MaxIdleConns < 32 {
+		tr.MaxIdleConns = 32
+	}
+	tr.DisableCompression = true
 	return tr
 }
 

@@ -53,6 +53,15 @@ type FileMeta struct {
 	SHA256   string `json:"sha256"`
 }
 
+// DirMeta is one directory inside a synced folder. Directories are tracked so
+// an empty folder created on one computer also appears on the other; files
+// alone would only carry their parent directories implicitly.
+type DirMeta struct {
+	FolderID string `json:"folder_id,omitempty"`
+	RelPath  string `json:"rel_path"`
+	ModTime  int64  `json:"mod_time,omitempty"`
+}
+
 // Tombstone records a file deletion so peers can distinguish a deleted file from a new file.
 type Tombstone struct {
 	FolderID  string `json:"folder_id,omitempty"`
@@ -66,6 +75,7 @@ type Manifest struct {
 	NodeID      string                 `json:"node_id"`
 	GeneratedAt int64                  `json:"generated_at"`
 	Folders     []config.FolderMapping `json:"folders,omitempty"`
+	Dirs        map[string]DirMeta     `json:"dirs,omitempty"`
 	Files       map[string]FileMeta    `json:"files"`
 	Tombstones  map[string]Tombstone   `json:"tombstones"`
 }
@@ -75,6 +85,7 @@ func NewManifest(nodeID string) Manifest {
 	return Manifest{
 		NodeID:      nodeID,
 		GeneratedAt: time.Now().UTC().UnixMilli(),
+		Dirs:        make(map[string]DirMeta),
 		Files:       make(map[string]FileMeta),
 		Tombstones:  make(map[string]Tombstone),
 	}
@@ -86,6 +97,9 @@ func (m Manifest) Clone() Manifest {
 	out.GeneratedAt = m.GeneratedAt
 	if len(m.Folders) > 0 {
 		out.Folders = append([]config.FolderMapping(nil), m.Folders...)
+	}
+	for k, v := range m.Dirs {
+		out.Dirs[k] = v
 	}
 	for k, v := range m.Files {
 		out.Files[k] = v
@@ -247,14 +261,24 @@ func (m *ignoreMatcher) MatchVirtual(virtualRel string, isDir bool) bool {
 
 // IndexStore caches file hashes by (RelPath, Size, ModTime) and persists state/tombstones.
 type IndexStore struct {
-	mu         sync.RWMutex
-	nodeID     string
-	statePath  string
-	folders    []config.FolderMapping
-	files      map[string]FileMeta
-	tombstones map[string]Tombstone
-	statuses   map[string]FileStatus
-	directions map[string]string
+	mu           sync.RWMutex
+	nodeID       string
+	statePath    string
+	folders      []config.FolderMapping
+	files        map[string]FileMeta
+	dirs         map[string]DirMeta
+	tombstones   map[string]Tombstone
+	statuses     map[string]FileStatus
+	statusCounts map[FileStatus]int
+	directions   map[string]string
+	addedDirs    []DirMeta
+	// newFilesPending marks newly scanned files 待同步 until a transfer
+	// confirms them. The host serves its files directly, so only a client
+	// that is allowed to push treats new local files as pending.
+	newFilesPending bool
+	// hashCache is created lazily so a zero-value IndexStore (as some callers
+	// still construct in tests) behaves exactly as it did before.
+	hashCache *fileHashCache
 
 	// folderStats and the global totals let Stats() run in O(1) instead of
 	// hashing every tracked file on every UI frame.
@@ -293,6 +317,7 @@ type folderStat struct {
 type persistedState struct {
 	NodeID      string               `json:"node_id"`
 	Files       map[string]FileMeta  `json:"files"`
+	Dirs        map[string]DirMeta   `json:"dirs,omitempty"`
 	Tombstones  map[string]Tombstone `json:"tombstones"`
 	FolderRoots map[string]string    `json:"folder_roots,omitempty"`
 	SavedAt     int64                `json:"saved_at,omitempty"`
@@ -304,12 +329,15 @@ func NewIndexStore(statePath string) *IndexStore {
 		nodeID:        newIndexNodeID(),
 		statePath:     statePath,
 		files:         make(map[string]FileMeta),
+		dirs:          make(map[string]DirMeta),
 		tombstones:    make(map[string]Tombstone),
 		statuses:      make(map[string]FileStatus),
+		statusCounts:  make(map[FileStatus]int),
 		directions:    make(map[string]string),
 		folderStats:   make(map[string]folderStat),
 		folderRoots:   make(map[string]string),
 		pendingWrites: make(map[string]struct{}),
+		hashCache:     newFileHashCache(),
 	}
 	s.load()
 	return s
@@ -357,6 +385,9 @@ func (s *IndexStore) load() {
 	if ps.Files != nil && len(ps.Files) > 0 {
 		s.files = ps.Files
 	}
+	if ps.Dirs != nil && len(ps.Dirs) > 0 {
+		s.dirs = ps.Dirs
+	}
 	if ps.Tombstones != nil && len(ps.Tombstones) > 0 {
 		s.tombstones = ps.Tombstones
 	}
@@ -371,6 +402,11 @@ func (s *IndexStore) load() {
 		s.folderStats[fid] = st
 		s.fileCount++
 		s.totalBytes += meta.Size
+		// Entries restored from the last run were synced before the app was
+		// closed; the first reconciliation re-checks them. Only files that the
+		// scanner discovers or sees change afterwards start as pending.
+		s.statuses[rel] = StatusSynced
+		s.statusCounts[StatusSynced]++
 	}
 	s.mu.Lock()
 	s.pruneTombstonesLocked(time.Now().UTC().UnixMilli())
@@ -431,12 +467,16 @@ func (s *IndexStore) saveNow() error {
 	ps := persistedState{
 		NodeID:      s.nodeID,
 		Files:       make(map[string]FileMeta, len(s.files)),
+		Dirs:        make(map[string]DirMeta, len(s.dirs)),
 		Tombstones:  make(map[string]Tombstone, len(s.tombstones)),
 		FolderRoots: make(map[string]string, len(s.folderRoots)),
 		SavedAt:     time.Now().UTC().UnixMilli(),
 	}
 	for k, v := range s.files {
 		ps.Files[k] = v
+	}
+	for k, v := range s.dirs {
+		ps.Dirs[k] = v
 	}
 	for k, v := range s.tombstones {
 		ps.Tombstones[k] = v
@@ -701,10 +741,16 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 
 	seen := make(map[string]FileMeta, 128)
 	changed := make([]FileMeta, 0, 8)
+	seenDirs := make(map[string]DirMeta, 32)
+	cachedHashes := s.hashCache
+	hashJobs := make([]hashJob, 0, 8)
 	var skipped int
 	var scanErrs []string
 
-	unreadableDirs, walkErr := walkFolderTree(rootDir, matcher, func(fullPath, innerRel string, d fs.DirEntry) {
+	unreadableDirs, walkErr := walkFolderTree(rootDir, matcher, func(innerDir string) {
+		virtualRel := JoinFolderRelPath(folder.ID, innerDir)
+		seenDirs[virtualRel] = DirMeta{FolderID: folder.ID, RelPath: virtualRel}
+	}, func(fullPath, innerRel string, d fs.DirEntry) {
 		info, infoErr := d.Info()
 		if infoErr != nil || !info.Mode().IsRegular() {
 			if infoErr != nil {
@@ -734,7 +780,7 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 			return
 		}
 
-		hash, hashErr := HashFile(fullPath)
+		hash, hashErr := cachedHashes.hashOrCompute(virtualRel, fullPath, size, mtime)
 		if hashErr != nil {
 			// The file may be locked by another program; keep its previous
 			// metadata instead of treating it as deleted.
@@ -747,6 +793,7 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 			}
 			return
 		}
+		hashJobs = append(hashJobs, hashJob{rel: virtualRel, fullPath: fullPath, size: size, mtime: mtime, hash: hash})
 		meta := FileMeta{
 			FolderID: folder.ID,
 			RelPath:  virtualRel,
@@ -826,7 +873,7 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 			continue
 		}
 		delete(s.files, rel)
-		delete(s.statuses, rel)
+		s.deleteStatusLocked(rel)
 		delete(s.directions, rel)
 		if matcher.Match(inner, false) {
 			// Newly ignored files are dropped without a deletion event.
@@ -842,10 +889,21 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 		deleted = append(deleted, tomb)
 	}
 
+	// A file the walk discovered as new or changed has not reached the peer
+	// yet; the next upload or reconciliation moves it to 已同步. The host
+	// serves its own files directly and can never upload to a client, so its
+	// local files count as synced; a client that may push does not.
+	pendingSet := make(map[string]struct{}, len(changed))
+	if s.newFilesPending {
+		for _, meta := range changed {
+			pendingSet[meta.RelPath] = struct{}{}
+		}
+	}
 	for rel, meta := range seen {
 		s.files[rel] = meta
-		if _, ok := s.statuses[rel]; !ok {
-			s.statuses[rel] = StatusSynced
+		s.ensureStatusLocked(rel)
+		if _, isNewOrChanged := pendingSet[rel]; isNewOrChanged {
+			s.markPendingLocked(rel)
 		}
 		if _, ok := s.directions[rel]; !ok {
 			s.directions[rel] = "本地"
@@ -855,11 +913,26 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 		}
 	}
 
+	// Directories are only ever created on this side from an explicit scan of
+	// a folder that exists, or from a peer's manifest. Dropping them here would
+	// forget empty folders without telling the peer anything, so they persist.
+	for rel, dir := range seenDirs {
+		if _, ok := s.dirs[rel]; !ok {
+			s.dirs[rel] = dir
+			s.addedDirs = append(s.addedDirs, dir)
+		}
+	}
+
 	s.setFolderStatLocked(folder.ID, newStat)
 	s.folderRoots[folder.ID] = rootKey
 	s.upsertFolderLocked(folder)
 	s.generation++
 	s.mu.Unlock()
+
+	// Prepare digests for the files that just changed so the next scan stays a
+	// metadata walk, and let the transfers reuse them.
+	s.hashCache.retain(hashJobs)
+	s.hashCache.prefetch(hashJobs)
 
 	if skipped > 0 {
 		detail := fmt.Sprintf("%d 个文件或目录暂时无法读取", skipped)
@@ -877,7 +950,7 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 // empty tree, which must never be mistaken for a mass deletion. Nested
 // symlinks/junctions are not followed. Unreadable subdirectories are returned
 // so callers can preserve their cached entries; an unreadable root is fatal.
-func walkFolderTree(root string, matcher *ignoreMatcher, onFile func(fullPath, innerRel string, d fs.DirEntry)) ([]string, error) {
+func walkFolderTree(root string, matcher *ignoreMatcher, onDir func(innerRel string), onFile func(fullPath, innerRel string, d fs.DirEntry)) ([]string, error) {
 	var unreadable []string
 	var walk func(dir, rel string) error
 	walk = func(dir, rel string) error {
@@ -902,6 +975,9 @@ func walkFolderTree(root string, matcher *ignoreMatcher, onFile func(fullPath, i
 			if entry.IsDir() {
 				if entry.Type()&fs.ModeSymlink != 0 {
 					continue
+				}
+				if onDir != nil {
+					onDir(innerRel)
 				}
 				if err := walk(fullPath, innerRel); err != nil {
 					return err
@@ -929,6 +1005,9 @@ func (s *IndexStore) Snapshot() Manifest {
 	if len(s.folders) > 0 {
 		m.Folders = append([]config.FolderMapping(nil), s.folders...)
 	}
+	for k, v := range s.dirs {
+		m.Dirs[k] = v
+	}
 	for k, v := range s.files {
 		m.Files[k] = v
 	}
@@ -948,7 +1027,7 @@ func (s *IndexStore) MarkFileSynced(meta FileMeta, status FileStatus, direction 
 	prev, existed := s.files[meta.RelPath]
 	s.files[meta.RelPath] = meta
 	delete(s.tombstones, meta.RelPath)
-	s.statuses[meta.RelPath] = status
+	s.setStatusLocked(meta.RelPath, status)
 	if direction != "" {
 		s.directions[meta.RelPath] = direction
 	}
@@ -977,7 +1056,7 @@ func (s *IndexStore) SetFileStatus(relPath string, status FileStatus, direction 
 	s.mu.Lock()
 	if _, ok := s.files[relPath]; ok {
 		changed := s.statuses[relPath] != status || (direction != "" && s.directions[relPath] != direction)
-		s.statuses[relPath] = status
+		s.setStatusLocked(relPath, status)
 		if direction != "" {
 			s.directions[relPath] = direction
 		}
@@ -994,7 +1073,7 @@ func (s *IndexStore) MarkFileDeleted(relPath string, deletedAt int64) Tombstone 
 	s.mu.Lock()
 	prev, existed := s.files[relPath]
 	delete(s.files, relPath)
-	delete(s.statuses, relPath)
+	s.deleteStatusLocked(relPath)
 	delete(s.directions, relPath)
 	delete(s.pendingWrites, relPath)
 	if existed {
@@ -1160,6 +1239,112 @@ func (s *IndexStore) upsertFolderLocked(folder config.FolderMapping) {
 	s.folders = append(s.folders, folder)
 }
 
+// setStatusLocked is the single writer for per-file status. Keeping the count
+// per status lets the UI show an unsynced total on every frame without
+// walking the whole index.
+func (s *IndexStore) setStatusLocked(rel string, st FileStatus) {
+	if rel == "" {
+		return
+	}
+	if st == "" {
+		st = StatusSynced
+	}
+	if old, ok := s.statuses[rel]; ok {
+		if s.statusCounts[old] > 0 {
+			s.statusCounts[old]--
+		}
+	}
+	s.statuses[rel] = st
+	s.statusCounts[st]++
+}
+
+func (s *IndexStore) deleteStatusLocked(rel string) {
+	if old, ok := s.statuses[rel]; ok {
+		s.statusCounts[old]--
+		delete(s.statuses, rel)
+	}
+}
+
+// markPendingLocked moves a newly discovered or changed file to 待同步 unless
+// a transfer already owns that path. A transfer finishing later sets its own
+// status, so overwriting "上传中" here would make the table flicker.
+func (s *IndexStore) markPendingLocked(rel string) {
+	switch s.statuses[rel] {
+	case StatusUploading, StatusDownloading:
+		return
+	}
+	s.setStatusLocked(rel, StatusPending)
+}
+
+func (s *IndexStore) ensureStatusLocked(rel string) {
+	if _, ok := s.statuses[rel]; !ok {
+		s.setStatusLocked(rel, StatusSynced)
+	}
+}
+
+// TakeAddedDirs returns directories discovered since the last call, so the
+// engine can tell the peer about an empty folder as soon as it appears.
+func (s *IndexStore) TakeAddedDirs() []DirMeta {
+	s.mu.Lock()
+	out := s.addedDirs
+	s.addedDirs = nil
+	s.mu.Unlock()
+	return out
+}
+
+// DirsList returns a copy of the indexed directories for a manifest request.
+func (s *IndexStore) DirsList() []DirMeta {
+	s.mu.RLock()
+	out := make([]DirMeta, 0, len(s.dirs))
+	for _, d := range s.dirs {
+		out = append(out, d)
+	}
+	s.mu.RUnlock()
+	return out
+}
+
+// SetNewFilesPending controls whether files discovered by a later scan start
+// as 待同步. It is set from the role and direction before scans run.
+func (s *IndexStore) SetNewFilesPending(pending bool) {
+	s.mu.Lock()
+	s.newFilesPending = pending
+	s.mu.Unlock()
+}
+
+// AddDir records a directory learned from the peer or created for it.
+func (s *IndexStore) AddDir(dir DirMeta) {
+	if dir.RelPath == "" {
+		return
+	}
+	s.mu.Lock()
+	if _, ok := s.dirs[dir.RelPath]; !ok {
+		s.dirs[dir.RelPath] = dir
+		s.generation++
+	}
+	s.mu.Unlock()
+}
+
+// DirCount reports how many directories the index knows, for the UI's
+// folder totals.
+func (s *IndexStore) DirCount() int {
+	s.mu.RLock()
+	n := len(s.dirs)
+	s.mu.RUnlock()
+	return n
+}
+
+// UnsyncedCount reports how many indexed files have not been confirmed on the
+// peer yet (pending, transferring, failed or conflicted).
+func (s *IndexStore) UnsyncedCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := s.fileCount - s.statusCounts[StatusSynced]
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
 func (s *IndexStore) setFolderStatLocked(fid string, st folderStat) {
 	old := s.folderStats[fid]
 	s.fileCount += st.files - old.files
@@ -1200,7 +1385,7 @@ func (s *IndexStore) removeInactiveFoldersLocked(active map[string]struct{}) {
 		}
 		prev := s.files[rel]
 		delete(s.files, rel)
-		delete(s.statuses, rel)
+		s.deleteStatusLocked(rel)
 		delete(s.directions, rel)
 		st := s.folderStats[fid]
 		st.files--
@@ -1215,6 +1400,12 @@ func (s *IndexStore) removeInactiveFoldersLocked(active map[string]struct{}) {
 		}
 		if _, ok := active[fid]; !ok {
 			delete(s.tombstones, rel)
+		}
+	}
+	for rel := range s.dirs {
+		fid, _ := SplitFolderRelPath(rel)
+		if _, ok := active[fid]; !ok {
+			delete(s.dirs, rel)
 		}
 	}
 	for fid := range s.folderRoots {

@@ -125,10 +125,14 @@ type Config struct {
 	OpenAtLogin      bool            `json:"open_at_login"`
 	KeepAwake        bool            `json:"keep_awake"`
 	MinimizeToTray   bool            `json:"minimize_to_tray"`
-	CloudflaredPath  string          `json:"cloudflared_path"`
-	IgnorePatterns   []string        `json:"ignore_patterns"`
-	SidebarWidth     float32         `json:"sidebar_width"`
-	TableColumns     []string        `json:"table_columns,omitempty"`
+	// TrayCloseNotice shows a desktop notification the first time the main
+	// window is closed to the tray. Off by default: closing the window is a
+	// deliberate background action and should not also raise a message.
+	TrayCloseNotice bool     `json:"tray_close_notice"`
+	CloudflaredPath string   `json:"cloudflared_path"`
+	IgnorePatterns  []string `json:"ignore_patterns"`
+	SidebarWidth    float32  `json:"sidebar_width"`
+	TableColumns    []string `json:"table_columns,omitempty"`
 }
 
 // DefaultIgnorePatterns returns sensible default ignore patterns for Windows 11 folders.

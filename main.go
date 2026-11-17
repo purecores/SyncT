@@ -67,7 +67,9 @@ func main() {
 			if !quitting && app.Config().MinimizeToTray {
 				e.PreventDefault()
 				mainWin.Hide()
-				if mygo.NotificationsSupported() {
+				// Closing to the tray is a deliberate background action; the
+				// notification is optional and toggled from the status bar.
+				if app.Config().TrayCloseNotice && mygo.NotificationsSupported() {
 					n := mygo.NewNotification(mygo.NotificationOptions{
 						ID:     "synct-tray-notice",
 						Title:  "SyncT 正在后台运行",

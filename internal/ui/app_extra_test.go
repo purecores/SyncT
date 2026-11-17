@@ -57,10 +57,17 @@ func TestCachedVisibleFiles(t *testing.T) {
 	}
 
 	app.fileSearch = ""
-	app.fileFilterIdx = 1 // 已同步 only
+	// A host serves its files directly, so its local files are not waiting
+	// on an outbound transfer.
+	app.fileFilterIdx = 1
 	r5 := app.cachedVisibleFiles(files, version)
 	if len(r5) != 2 {
-		t.Fatalf("status filter = %d; want 2 synced", len(r5))
+		t.Fatalf("synced filter = %d; want 2", len(r5))
+	}
+	app.fileFilterIdx = 2
+	r6 := app.cachedVisibleFiles(files, version)
+	if len(r6) != 0 {
+		t.Fatalf("unsynced filter = %d; want 0 on the host", len(r6))
 	}
 
 	// A new file changes the index generation and must invalidate the cache.

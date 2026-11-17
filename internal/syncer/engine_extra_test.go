@@ -392,6 +392,8 @@ func TestStatsAndSpeedDecay(t *testing.T) {
 	}, StatusSynced, "本地")
 	engine.recordUpload("x.txt", 4096, 10*time.Millisecond)
 	engine.recordDownload("x.txt", 2048, 10*time.Millisecond)
+	engine.countUploadBytes(4096)
+	engine.countDownloadBytes(2048)
 
 	st := engine.Stats()
 	if st.TotalFiles != 1 || st.TotalBytes != 1234 {

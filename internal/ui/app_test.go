@@ -11,135 +11,204 @@ import (
 	"synct/internal/config"
 )
 
-func TestAppViewHeadlessNavigationAndInteractions(t *testing.T) {
-	tmpRoot := t.TempDir()
-	t.Setenv("SYNCT_DATA_DIR", tmpRoot)
+// newTestApp builds a host app over a temporary folder with the given files.
+func newTestApp(t *testing.T, root string, files map[string]string) *App {
+	t.Helper()
+	return newTestAppRole(t, root, files, config.RoleHost)
+}
 
-	syncDir := filepath.Join(tmpRoot, "SyncFolder")
+func newTestAppRole(t *testing.T, root string, files map[string]string, role config.Role) *App {
+	t.Helper()
+	t.Setenv("SYNCT_DATA_DIR", root)
+	syncDir := filepath.Join(root, "SyncFolder")
 	if err := os.MkdirAll(syncDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(syncDir, "report.docx"), []byte("quarterly report content"), 0o644); err != nil {
-		t.Fatal(err)
+	for name, content := range files {
+		full := filepath.Join(syncDir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.WriteFile(filepath.Join(syncDir, "notes.txt"), []byte("meeting notes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	cfg := config.Default()
 	cfg.SyncDir = syncDir
+	cfg.Role = role
 	cfg.TunnelMode = config.TunnelDirect
+	app := NewApp(cfg, filepath.Join(root, "state.json"))
+	app.OpenPathFunc = func(string) {}
+	app.RevealPathFunc = func(string) {}
+	app.ClipboardWriteFn = func(string) {}
+	return app
+}
 
-	app := NewApp(cfg, filepath.Join(tmpRoot, "state.json"))
+func TestAppOverviewShowsQuietDashboard(t *testing.T) {
+	app := newTestApp(t, t.TempDir(), map[string]string{
+		"report.docx":    "quarterly report content",
+		"notes.txt":      "meeting notes",
+		"archive/a.json": "{}",
+	})
 	defer app.StopAll()
 
-	// 1. Test at default window size (1060 x 720)
 	tt := ui.NewTester(app.View, 1060, 720)
-	if !tt.HasText("SyncT") || !tt.HasText("同步文件夹与隧道连接配置") {
-		t.Fatalf("expected overview page texts, got %v", tt.Texts())
+	for _, want := range []string{"SyncT", "当前吞吐", "受控文件", "同步文件夹", "连接"} {
+		if !tt.HasText(want) {
+			t.Fatalf("overview is missing %q, texts=%v", want, tt.Texts())
+		}
 	}
-	// Verify bottom-left real-time sync info panel and multi-folder mapping section are rendered
-	if !tt.HasText("实时同步信息") || !tt.HasText("文件总计:") || !tt.HasText("累计流量:") {
-		t.Fatalf("expected bottom-left sync info telemetry in sidebar, got %v", tt.Texts())
-	}
-	if !tt.HasText("多文件夹同步与跨机目录映射 (本机文件夹 <-> 另一台电脑目标文件夹)") {
-		t.Fatalf("expected multi-folder mapping section, got %v", tt.Texts())
+	// Folder management moved to settings; the dense connection form is gone
+	// from the overview.
+	if tt.HasText("多文件夹同步与跨机目录映射 (本机文件夹 <-> 另一台电脑目标文件夹)") {
+		t.Fatal("overview must not embed the full folder-mapping form")
 	}
 	if tt.FramePending() {
-		t.Error("expected settled overview frame with FramePending() == false")
+		t.Error("expected a settled overview frame")
 	}
+}
 
-	// 2. Switch from Host Mode to Client Mode via Segmented control and parse a ShareCode
+func TestAppClientModeAndShareCode(t *testing.T) {
+	app := newTestApp(t, t.TempDir(), map[string]string{"a.txt": "a"})
+	defer app.StopAll()
+
+	tt := ui.NewTester(app.View, 1100, 760)
+	if err := tt.Click("设置"); err != nil {
+		t.Fatalf("open settings: %v", err)
+	}
 	if err := tt.Click("节点模式 (连接远端)"); err != nil {
-		t.Fatalf("click Client mode segment: %v", err)
+		t.Fatalf("click client mode: %v", err)
 	}
 	if app.Config().Role != config.RoleClient {
-		t.Fatalf("expected RoleClient after clicking segment, got %s", app.Config().Role)
+		t.Fatalf("role = %s; want client", app.Config().Role)
 	}
 
-	sampleCode := config.EncodeShareCode("https://demo-sync.trycloudflare.com", "st_new_secret_999")
-	app.shareInput = sampleCode
+	app.shareInput = config.EncodeShareCode("https://demo-sync.trycloudflare.com", "st_new_secret_999")
 	tt.Frame()
 	if err := tt.Click("解析填充"); err != nil {
-		t.Fatalf("click 解析填充: %v", err)
+		t.Fatalf("apply share code: %v", err)
 	}
-	if app.Config().RemoteURL != "https://demo-sync.trycloudflare.com" || app.Config().AuthToken != "st_new_secret_999" {
-		t.Fatalf("share code not applied: url=%q token=%q", app.Config().RemoteURL, app.Config().AuthToken)
+	if got := app.Config().RemoteURL; got != "https://demo-sync.trycloudflare.com" {
+		t.Fatalf("remote url = %q", got)
 	}
+	if got := app.Config().AuthToken; got != "st_new_secret_999" {
+		t.Fatalf("token = %q", got)
+	}
+}
 
-	// Switch back to Host Mode and test starting/stopping direct sync
-	if err := tt.Click("主机模式 (发布隧道)"); err != nil {
-		t.Fatalf("click Host mode segment: %v", err)
-	}
-	if err := tt.Click("启动隧道并同步"); err != nil {
-		t.Fatalf("click 启动隧道并同步: %v", err)
+func TestAppStartStopFromHeader(t *testing.T) {
+	app := newTestApp(t, t.TempDir(), map[string]string{"a.txt": "a"})
+	defer app.StopAll()
+
+	tt := ui.NewTester(app.View, 1100, 760)
+	if err := tt.Click("开始同步"); err != nil {
+		t.Fatalf("start: %v", err)
 	}
 	if !app.Engine().IsRunning() {
-		t.Fatal("expected engine to be running after clicking start")
+		t.Fatal("engine should run after 开始同步")
 	}
 	if err := tt.Click("停止同步"); err != nil {
-		t.Fatalf("click 停止同步: %v", err)
+		t.Fatalf("stop: %v", err)
 	}
 	if app.Engine().IsRunning() {
-		t.Fatal("expected engine to be stopped after clicking stop")
+		t.Fatal("engine should stop after 停止同步")
 	}
+}
 
-	// 3. Navigate to Files section and verify Table + SearchField
-	if err := tt.Click("同步文件列表"); err != nil {
-		t.Fatalf("click 同步文件列表: %v", err)
+func TestAppFilesAndPendingPages(t *testing.T) {
+	// A client that has not connected yet has local files waiting to go out.
+	app := newTestAppRole(t, t.TempDir(), map[string]string{
+		"report.docx": "quarterly report content",
+		"notes.txt":   "meeting notes",
+	}, config.RoleClient)
+	defer app.StopAll()
+
+	tt := ui.NewTester(app.View, 1060, 720)
+	if err := tt.Click("文件"); err != nil {
+		t.Fatalf("open files: %v", err)
 	}
 	if !tt.HasText("report.docx") || !tt.HasText("notes.txt") {
-		t.Fatalf("expected both files in table, got %v", tt.Texts())
+		t.Fatalf("files table is missing entries, texts=%v", tt.Texts())
 	}
 
-	// Filter files via search query
 	app.fileSearch = "report"
 	tt.Frame()
 	if !tt.HasText("report.docx") || tt.HasText("notes.txt") {
-		t.Fatalf("expected only report.docx when filtering by 'report', got %v", tt.Texts())
+		t.Fatalf("search filter kept the wrong rows, texts=%v", tt.Texts())
 	}
 	app.fileSearch = ""
 	tt.Frame()
 
-	// 4. Navigate to Logs section and test AlertDialog confirmation on Clear Logs
-	if err := tt.Click("实时传输日志"); err != nil {
-		t.Fatalf("click 实时传输日志: %v", err)
+	if err := tt.Click("未同步"); err != nil {
+		t.Fatalf("open pending: %v", err)
+	}
+	// Both files are new and have not reached a peer yet.
+	if !tt.HasText("未同步文件") || !tt.HasText("report.docx") {
+		t.Fatalf("pending page should list unconfirmed files, texts=%v", tt.Texts())
+	}
+	if err := tt.Click("立即扫描并同步"); err != nil {
+		t.Fatalf("pending scan: %v", err)
+	}
+}
+
+func TestAppLogsClearConfirmation(t *testing.T) {
+	app := newTestApp(t, t.TempDir(), map[string]string{"a.txt": "a"})
+	defer app.StopAll()
+	app.Engine().Logf("hello log")
+
+	tt := ui.NewTester(app.View, 1060, 720)
+	if err := tt.Click("日志"); err != nil {
+		t.Fatalf("open logs: %v", err)
 	}
 	if err := tt.Click("清空日志"); err != nil {
-		t.Fatalf("click 清空日志: %v", err)
+		t.Fatalf("clear logs: %v", err)
 	}
 	if !app.confirmClearLogsOpen {
-		t.Fatal("expected confirmClearLogsOpen to be true")
+		t.Fatal("expected the confirmation dialog")
 	}
 	if err := tt.Click("确认清空"); err != nil {
-		t.Fatalf("click 确认清空 in AlertDialog: %v", err)
+		t.Fatalf("confirm clear: %v", err)
 	}
-	if len(app.Engine().Logs()) != 0 {
-		t.Fatalf("expected logs to be cleared, got %d entries", len(app.Engine().Logs()))
+	if got := len(app.Engine().Logs()); got != 0 {
+		t.Fatalf("logs = %d after clearing", got)
 	}
+}
 
-	// 5. Navigate to Settings section
-	if err := tt.Click("忽略规则与设置"); err != nil {
-		t.Fatalf("click 忽略规则与设置: %v", err)
+func TestAppSettingsSectionsAndTrayNoticeToggle(t *testing.T) {
+	app := newTestApp(t, t.TempDir(), map[string]string{"a.txt": "a"})
+	defer app.StopAll()
+
+	tt := ui.NewTester(app.View, 1060, 720)
+	if err := tt.Click("设置"); err != nil {
+		t.Fatalf("open settings: %v", err)
 	}
 	tt.Advance(2 * time.Second)
-	if !tt.HasText("文件过滤与冲突保护策略") {
-		t.Fatalf("expected settings page content, got %v", tt.Texts())
-	}
-	if tt.FramePending() {
-		t.Error("expected settled settings frame with FramePending() == false")
-	}
-
-	// 6. Verify layout at minimum window size (820 x 540)
-	tt.SetSize(820, 540)
-	tt.Advance(1 * time.Second)
-	if _, ok := tt.Find("主操作工具栏"); !ok {
-		// Check primary buttons remain visible and clickable at minimum window size
-		if _, okBtn := tt.Find("立即扫描同步"); !okBtn {
-			t.Errorf("expected toolbar controls visible at minimum window size 820x540")
+	for _, want := range []string{"文件夹与方向", "工作模式与连接", "文件规则", "运行与后台", "多文件夹与跨机映射"} {
+		if !tt.HasText(want) {
+			t.Fatalf("settings is missing section %q", want)
 		}
 	}
+
+	// The status bar switch is the same setting as the form's.
+	before := app.Config().TrayCloseNotice
+	if err := tt.Click("后台提示"); err != nil {
+		t.Fatalf("click status bar notice toggle: %v", err)
+	}
+	if app.Config().TrayCloseNotice == before {
+		t.Fatal("status bar toggle did not change TrayCloseNotice")
+	}
+}
+
+func TestAppMinimumWindowSize(t *testing.T) {
+	app := newTestApp(t, t.TempDir(), map[string]string{"a.txt": "a"})
+	defer app.StopAll()
+
+	tt := ui.NewTester(app.View, 820, 540)
+	tt.Advance(1 * time.Second)
+	if _, ok := tt.Find("开始同步"); !ok {
+		t.Fatal("primary action must stay visible at the minimum window size")
+	}
 	if tt.FramePending() {
-		t.Error("expected FramePending() == false at minimum window size")
+		t.Error("expected a settled frame at 820x540")
 	}
 }

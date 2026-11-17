@@ -24,12 +24,16 @@ import (
 	"synct/internal/config"
 )
 
+// SyncTProtocolVersion is reported by /api/status for compatibility checks.
+const SyncTProtocolVersion = "1.2.0"
+
 // SyncEventType identifies the kind of real-time change broadcast over SSE.
 type SyncEventType string
 
 const (
 	EventUpsert SyncEventType = "upsert"
 	EventDelete SyncEventType = "delete"
+	EventDir    SyncEventType = "dir"
 	EventRescan SyncEventType = "rescan"
 )
 
@@ -39,6 +43,7 @@ type SyncEvent struct {
 	OriginNode string        `json:"origin_node"`
 	File       *FileMeta     `json:"file,omitempty"`
 	Tombstone  *Tombstone    `json:"tombstone,omitempty"`
+	Dir        *DirMeta      `json:"dir,omitempty"`
 	Timestamp  int64         `json:"timestamp"`
 }
 
@@ -152,6 +157,7 @@ func (s *Server) startLocked(port int, allowLAN bool) (int, error) {
 	mux.HandleFunc("/api/status", s.withAuth(s.handleStatus))
 	mux.HandleFunc("/api/manifest", s.withAuth(s.handleManifest))
 	mux.HandleFunc("/api/file", s.withAuth(s.handleFile))
+	mux.HandleFunc("/api/dirs", s.withAuth(s.handleDirs))
 	mux.HandleFunc("/api/events", s.withAuth(s.handleEvents))
 
 	httpSrv := &http.Server{
@@ -357,7 +363,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	fileCount, totalBytes := s.engine.index.Counts()
 	resp := map[string]any{
 		"node_id":     s.engine.index.NodeID(),
-		"version":     "1.0.0",
+		"version":     SyncTProtocolVersion,
 		"file_count":  fileCount,
 		"total_bytes": totalBytes,
 		"peers":       s.ConnectedPeers(),
@@ -371,10 +377,17 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Body != nil {
 		defer r.Body.Close()
 		var reqPayload struct {
-			Folders []config.FolderMapping `json:"folders"`
+			Folders  []config.FolderMapping `json:"folders"`
+			Dirs     []DirMeta              `json:"dirs,omitempty"`
+			PushDirs bool                   `json:"push_dirs,omitempty"`
 		}
-		if err := json.NewDecoder(io.LimitReader(r.Body, 256*1024)).Decode(&reqPayload); err == nil && len(reqPayload.Folders) > 0 {
-			s.engine.ApplyPeerFolderMappings(reqPayload.Folders)
+		if err := json.NewDecoder(io.LimitReader(r.Body, 2*1024*1024)).Decode(&reqPayload); err == nil {
+			if len(reqPayload.Folders) > 0 {
+				s.engine.ApplyPeerFolderMappings(reqPayload.Folders)
+			}
+			if reqPayload.PushDirs && len(reqPayload.Dirs) > 0 {
+				s.engine.ApplyPeerDirs(reqPayload.Dirs, strings.TrimSpace(r.Header.Get("X-SyncT-Node")))
+			}
 		}
 	}
 	snap := s.engine.index.Snapshot()
@@ -383,6 +396,32 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(snap)
+}
+
+// handleDirs accepts directories pushed between reconciliations, which is how
+// a newly created empty folder appears on the other computer in real time
+// instead of waiting for the next periodic manifest exchange.
+func (s *Server) handleDirs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	defer r.Body.Close()
+	var payload struct {
+		OriginNode string    `json:"origin_node"`
+		Dirs       []DirMeta `json:"dirs"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4*1024*1024)).Decode(&payload); err != nil {
+		http.Error(w, "invalid directory payload", http.StatusBadRequest)
+		return
+	}
+	origin := payload.OriginNode
+	if origin == "" {
+		origin = strings.TrimSpace(r.Header.Get("X-SyncT-Node"))
+	}
+	created := s.engine.ApplyPeerDirs(payload.Dirs, origin)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]int{"created": created})
 }
 
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
@@ -457,7 +496,7 @@ func (s *Server) serveFileDownload(w http.ResponseWriter, _ *http.Request, relPa
 
 	start := time.Now()
 	buf := ioBufferPool.Get().(*[]byte)
-	n, err := io.CopyBuffer(w, f, *buf)
+	n, err := io.CopyBuffer(&progressWriter{w: w, onMove: s.engine.countUploadBytes}, f, *buf)
 	ioBufferPool.Put(buf)
 	if err != nil {
 		// Client went away mid-transfer or the disk stalled; nothing to retry here.
@@ -505,7 +544,7 @@ func (s *Server) serveFileUpload(w http.ResponseWriter, r *http.Request, cfg con
 
 	hasher := sha256.New()
 	buf := ioBufferPool.Get().(*[]byte)
-	written, copyErr := io.CopyBuffer(io.MultiWriter(tmpFile, hasher), r.Body, *buf)
+	written, copyErr := io.CopyBuffer(io.MultiWriter(tmpFile, &progressWriter{w: hasher, onMove: s.engine.countDownloadBytes}), r.Body, *buf)
 	ioBufferPool.Put(buf)
 	closeErr := tmpFile.Close()
 	if copyErr != nil || closeErr != nil {
