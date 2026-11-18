@@ -1680,6 +1680,9 @@ func (app *App) activeShareURL(stats syncer.Stats, pubURL, lanURL string) string
 }
 
 func (app *App) errorBannerText(stats syncer.Stats, tunErr string) string {
+	if stats.LargeUploadBlocked {
+		return "有大文件因隧道单次请求上限被拒：对端 SyncT 版本较旧，不支持分块上传。请把两端都升级到 v1.3.0 或更新版本。"
+	}
 	if stats.LastError != "" {
 		return stats.LastError
 	}

@@ -10,12 +10,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -59,6 +61,13 @@ const (
 	StateError      EngineState = "连接异常"
 )
 
+type activityBucket struct {
+	count int
+	bytes int64
+	last  string
+	first time.Time
+}
+
 // LogEntry is a timestamped activity record displayed in the UI log list.
 type LogEntry struct {
 	ID      int64
@@ -93,6 +102,10 @@ type Stats struct {
 	LastScanTime    time.Time
 	LastScanError   string
 	ScanErrors      int64
+	// LargeUploadBlocked reports that the peer refused a file for its size:
+	// its SyncT build predates chunked uploads and cannot cross the tunnel's
+	// per-request limit.
+	LargeUploadBlocked bool
 	// TLSRejected reports that cloudflared refused the local self-signed
 	// certificate, which makes the public tunnel answer 502 until the cert is
 	// trusted (or the ingress sets noTLSVerify).
@@ -134,9 +147,21 @@ type Engine struct {
 	scanErrors      atomic.Int64
 	logSeq          atomic.Int64
 	tlsRejected     atomic.Bool
+	largeBlocked    atomic.Bool
 
 	logsMu sync.RWMutex
 	logs   []LogEntry
+
+	// Health cadences are per engine so a test can shorten them without
+	// racing a loop left by a previous engine.
+	hostHealthEvery  time.Duration
+	publicProbeEvery time.Duration
+
+	// Activity is aggregated: a bulk sync produces thousands of successful
+	// transfers, and one log line each buries the warnings the user needs to
+	// see. noteSynced counts them and flushActivities writes one summary.
+	activityMu sync.Mutex
+	activities map[string]*activityBucket
 
 	runCancel   context.CancelFunc
 	reconcileMu sync.Mutex
@@ -176,16 +201,19 @@ func NewEngine(cfg config.Config, statePath string, onUpdate func()) *Engine {
 		tr.ResponseHeaderTimeout = 45 * time.Second
 	}
 	e := &Engine{
-		cfg:           cfg,
-		index:         NewIndexStore(statePath),
-		onUpdate:      onUpdate,
-		state:         StateStopped,
-		scanPending:   make(map[string]struct{}),
-		scanWake:      make(chan struct{}, 1),
-		watchCfgCh:    make(chan struct{}, 1),
-		remoteEvents:  make(chan SyncEvent, remoteEventBuffer),
-		reconcileWake: make(chan struct{}, 1),
-		logThrottle:   make(map[string]time.Time),
+		cfg:              cfg,
+		index:            NewIndexStore(statePath),
+		onUpdate:         onUpdate,
+		state:            StateStopped,
+		scanPending:      make(map[string]struct{}),
+		scanWake:         make(chan struct{}, 1),
+		watchCfgCh:       make(chan struct{}, 1),
+		remoteEvents:     make(chan SyncEvent, remoteEventBuffer),
+		reconcileWake:    make(chan struct{}, 1),
+		hostHealthEvery:  hostHealthInterval,
+		publicProbeEvery: publicProbeInterval,
+		activities:       make(map[string]*activityBucket),
+		logThrottle:      make(map[string]time.Time),
 		client: &http.Client{
 			Transport: tr,
 			Timeout:   2 * time.Minute,
@@ -527,6 +555,7 @@ func (e *Engine) Stop() {
 	if cancel != nil {
 		cancel()
 	}
+	e.flushActivities()
 	e.server.Stop()
 	if err := e.index.Flush(); err != nil {
 		e.LogLevel("WARN", fmt.Sprintf("停止时保存状态索引失败: %v", err))
@@ -956,12 +985,12 @@ func (e *Engine) runLocalScan(ctx context.Context, pending map[string]struct{}, 
 			e.reconcileMu.Lock()
 			if cfg.SyncDirection != config.SyncPullOnly {
 				if len(addedDirs) > 0 {
-					if err := e.pushDirsToRemote(ctx, cfg, addedDirs); err != nil {
+					if err := e.pushDirsToRemote(ctx, cfg, addedDirs); err != nil && !transferCanceled(ctx, err) {
 						e.LogThrottled("dir-push:"+err.Error(), "WARN", fmt.Sprintf("同步空文件夹失败: %v", err), 30*time.Second)
 					}
 				}
 				runTransferTasks(ctx, changed, func(f FileMeta) int64 { return f.Size }, func(f FileMeta) {
-					if err := e.pushFileToRemote(ctx, cfg, f, ""); err != nil {
+					if err := e.pushFileToRemote(ctx, cfg, f, ""); err != nil && !transferCanceled(ctx, err) {
 						e.LogThrottled("push:"+f.RelPath+":"+err.Error(), "WARN", fmt.Sprintf("上传 %s 失败: %v", f.RelPath, err), 30*time.Second)
 					}
 				})
@@ -1162,8 +1191,10 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 		locTomb, hasLocTomb := localManifest.Tombstones[rel]
 
 		if !hasLocal {
-			// If deleted locally more recently than remote file's mtime, push deletion to remote
-			if hasLocTomb && locTomb.DeletedAt > remFile.ModTime {
+			// If deleted locally more recently than the remote file was last
+			// changed or seen, push the deletion; otherwise the remote copy was
+			// restored after our delete and wins.
+			if hasLocTomb && locTomb.DeletedAt > effectiveTime(remFile) {
 				if canPush && cfg.SyncDeletions {
 					if err := e.pushDeleteToRemote(ctx, cfg, locTomb); err != nil {
 						e.LogThrottled("del:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("同步删除 %s 失败: %v", rel, err), 30*time.Second)
@@ -1180,6 +1211,7 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 		// Both have the file: check if identical
 		if locFile.SHA256 == remFile.SHA256 {
 			e.index.SetFileStatus(rel, StatusSynced, "双向一致")
+			e.index.ClearDirty(rel)
 			continue
 		}
 
@@ -1208,7 +1240,7 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 			continue
 		}
 		remTomb, hasRemTomb := remoteManifest.Tombstones[rel]
-		if hasRemTomb && remTomb.DeletedAt >= locFile.ModTime {
+		if hasRemTomb && remTomb.DeletedAt >= effectiveTime(locFile) {
 			if canPull && cfg.SyncDeletions {
 				if err := e.deleteLocalFile(cfg, rel, remTomb.DeletedAt, "同步远端删除"); err != nil {
 					e.LogThrottled("del-local:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("删除本地文件 %s 失败: %v", rel, err), 30*time.Second)
@@ -1222,12 +1254,12 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 	}
 
 	runTransferTasks(ctx, pulls, func(t pullTask) int64 { return t.rem.Size }, func(t pullTask) {
-		if err := e.pullFileFromRemote(ctx, cfg, t.rem, t.conflict); err != nil {
+		if err := e.pullFileFromRemote(ctx, cfg, t.rem, t.conflict); err != nil && !transferCanceled(ctx, err) {
 			e.LogThrottled("pull:"+t.rel+":"+err.Error(), "WARN", fmt.Sprintf("下载文件 %s 失败: %v", t.rel, err), 30*time.Second)
 		}
 	})
 	runTransferTasks(ctx, pushes, func(t pushTask) int64 { return t.loc.Size }, func(t pushTask) {
-		if err := e.pushFileToRemote(ctx, cfg, t.loc, t.baseHash); err != nil {
+		if err := e.pushFileToRemote(ctx, cfg, t.loc, t.baseHash); err != nil && !transferCanceled(ctx, err) {
 			e.LogThrottled("push:"+t.rel+":"+err.Error(), "WARN", fmt.Sprintf("上传文件 %s 失败: %v", t.rel, err), 30*time.Second)
 		}
 	})
@@ -1646,7 +1678,7 @@ func (e *Engine) processRemoteEventsLocked(ctx context.Context, pending map[stri
 				continue
 			}
 			if tomb, hasTomb := e.index.Tombstone(ev.File.RelPath); hasTomb &&
-				cfg.SyncDirection != config.SyncPullOnly && tomb.DeletedAt > ev.File.ModTime {
+				cfg.SyncDirection != config.SyncPullOnly && tomb.DeletedAt > effectiveTime(*ev.File) {
 				// A newer local deletion must not be undone by a stale upsert.
 				needReconcile = true
 				continue
@@ -1659,6 +1691,9 @@ func (e *Engine) processRemoteEventsLocked(ctx context.Context, pending map[stri
 			}
 			saveConflict := cfg.ConflictPolicy == config.ConflictKeepBoth && hasLocal
 			if err := e.pullFileFromRemote(ctx, cfg, *ev.File, saveConflict); err != nil {
+				if transferCanceled(ctx, err) {
+					return false
+				}
 				e.LogThrottled("pull:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("实时下载 %s 失败: %v", rel, err), 30*time.Second)
 				continue
 			}
@@ -1678,7 +1713,7 @@ func (e *Engine) processRemoteEventsLocked(ctx context.Context, pending map[stri
 				continue
 			}
 			if loc, hasLocal := e.index.FileMeta(ev.Tombstone.RelPath); hasLocal &&
-				cfg.SyncDirection != config.SyncPullOnly && loc.ModTime > ev.Tombstone.DeletedAt {
+				cfg.SyncDirection != config.SyncPullOnly && effectiveTime(loc) > ev.Tombstone.DeletedAt {
 				// A local edit newer than the remote deletion wins; reconcile
 				// decides whether to resurrect the file or apply the delete.
 				needReconcile = true
@@ -1702,12 +1737,37 @@ func (e *Engine) processRemoteEventsLocked(ctx context.Context, pending map[stri
 // message. 502 from Cloudflare means the work PC reached the edge but the
 // host's origin was unreachable; retrying forever without saying why leaves
 // the user staring at "远端返回状态码 502" with no hint of what to fix.
-func remoteStatusError(action string, status int, body string) error {
-	detail := strings.TrimSpace(body)
-	if len(detail) > 200 {
-		detail = detail[:200]
+var htmlTagRE = regexp.MustCompile(`<[^>]*>`)
+
+// cleanHTTPBody turns an edge error page into one line. Cloudflare's 413/524
+// bodies carry a full HTML page and an analytics script; writing that into the
+// activity log hid the actual failure and made the UI unreadable.
+func cleanHTTPBody(body string) string {
+	s := htmlTagRE.ReplaceAllString(body, " ")
+	s = html.UnescapeString(s)
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 180 {
+		s = s[:180] + "…"
 	}
+	return s
+}
+
+// errTooLarge marks an upload the edge refused for its size (Cloudflare's
+// free-plan body cap is 100 MB, and its edge returns 413 before the origin
+// ever sees the request).
+var errTooLarge = errors.New("文件超过隧道允许的单次上传大小")
+
+// errGatewayTimeout marks a 524: the tunnel edge gave up waiting for the
+// origin before the request finished.
+var errGatewayTimeout = errors.New("隧道边缘等待源站超时")
+
+func remoteStatusError(action string, status int, body string) error {
+	detail := cleanHTTPBody(body)
 	switch status {
+	case http.StatusRequestEntityTooLarge:
+		return fmt.Errorf("%s失败: %w (HTTP 413)。Cloudflare 隧道对单个请求体有 100MB 上限，SyncT 会改为分块上传，此提示通常表示补丁请求本身异常", action, errTooLarge)
+	case 524:
+		return fmt.Errorf("%s失败: %w (HTTP 524)。请检查主机端上行与 Cloudflared 源站；SyncT 会用分块续传重试", action, errGatewayTimeout)
 	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		msg := fmt.Sprintf("%s失败: 公网隧道返回 %d (源站不可达)。请确认主机端 SyncT 正在运行且本地监听端口 (18920) 未被占用，并重启主机端同步以恢复 Cloudflared 回源。", action, status)
 		if detail != "" {
@@ -1775,6 +1835,14 @@ func (e *Engine) fetchRemoteManifest(ctx context.Context, baseURL, token string,
 	return m, nil
 }
 
+// transferCanceled reports a transfer that stopped because the engine is
+// shutting down or switching configuration, not one that failed. Those are
+// expected: logging one warning per in-flight file fills the log with noise
+// the user cannot act on, and marking them errors hides the real state.
+func transferCanceled(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled)
+}
+
 func transferTimeout(size int64) time.Duration {
 	const minTimeout = 2 * time.Minute
 	const maxTimeout = 60 * time.Minute
@@ -1789,7 +1857,59 @@ func transferTimeout(size int64) time.Duration {
 	return d
 }
 
+// fetchRemoteFile opens a download and retries a failed request a few times.
+// The work-PC log showed three downloads failing with "哈希校验失败" in a row:
+// one transient bad response turned into a visible error, and the mirror image
+// (a truncated 200 response) would silently fail the digest check after the
+// whole body arrived. A retry costs one request and removes both.
+func (e *Engine) fetchRemoteFile(transferCtx, ctx context.Context, cfg config.Config, u string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		req, err := http.NewRequestWithContext(transferCtx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("X-SyncT-Token", cfg.AuthToken)
+		req.Header.Set("X-SyncT-Node", e.index.NodeID())
+		resp, err := e.transfer.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("请求远端文件失败: %w", err)
+			if transferCanceled(ctx, err) {
+				return nil, lastErr
+			}
+			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		lastErr = remoteStatusError("下载文件", resp.StatusCode, "")
+		resp.Body.Close()
+		// Only a gateway/edge failure is worth retrying; a 404 or 403 is the
+		// peer's answer and will not change on the next attempt.
+		if resp.StatusCode != http.StatusBadGateway && resp.StatusCode != http.StatusServiceUnavailable &&
+			resp.StatusCode != http.StatusGatewayTimeout && resp.StatusCode != 524 && resp.StatusCode != 520 {
+			return nil, lastErr
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
 func (e *Engine) pullFileFromRemote(ctx context.Context, cfg config.Config, rem FileMeta, saveConflict bool) error {
+	return e.pullFile(ctx, cfg, rem, saveConflict, false)
+}
+
+// pullFileFromRemoteRetry is the one retry after a digest mismatch, so the
+// failure path can call back in without recursing forever.
+func (e *Engine) pullFileFromRemoteRetry(ctx context.Context, cfg config.Config, rem FileMeta, saveConflict bool) error {
+	return e.pullFile(ctx, cfg, rem, saveConflict, true)
+}
+
+func (e *Engine) pullFile(ctx context.Context, cfg config.Config, rem FileMeta, saveConflict, retried bool) error {
 	rel, ok := CleanRelPath(rem.RelPath)
 	if !ok {
 		return errors.New("invalid remote path")
@@ -1810,25 +1930,16 @@ func (e *Engine) pullFileFromRemote(ctx context.Context, cfg config.Config, rem 
 	u := fmt.Sprintf("%s/api/file?path=%s", baseURL, url.QueryEscape(rel))
 	transferCtx, cancel := context.WithTimeout(ctx, transferTimeout(rem.Size))
 	defer cancel()
-	req, err := http.NewRequestWithContext(transferCtx, http.MethodGet, u, nil)
+	resp, err := e.fetchRemoteFile(transferCtx, ctx, cfg, u)
 	if err != nil {
+		if transferCanceled(ctx, err) {
+			e.index.SetFileStatus(rel, StatusPending, "等待重试")
+			return context.Canceled
+		}
 		e.index.SetFileStatus(rel, StatusError, "下载失败")
 		return err
 	}
-	req.Header.Set("X-SyncT-Token", cfg.AuthToken)
-	req.Header.Set("X-SyncT-Node", e.index.NodeID())
-
-	resp, err := e.transfer.Do(req)
-	if err != nil {
-		e.index.SetFileStatus(rel, StatusError, "下载失败")
-		return fmt.Errorf("请求远端文件失败: %w", err)
-	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		e.index.SetFileStatus(rel, StatusError, "下载失败")
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
 
 	parentDir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(parentDir, 0o755); err != nil {
@@ -1853,6 +1964,10 @@ func (e *Engine) pullFileFromRemote(ctx context.Context, cfg config.Config, rem 
 	closeErr := tmpFile.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(tmpPath)
+		if copyErr != nil && transferCanceled(ctx, copyErr) {
+			e.index.SetFileStatus(rel, StatusPending, "等待重试")
+			return context.Canceled
+		}
 		e.index.SetFileStatus(rel, StatusError, "下载失败")
 		if copyErr != nil {
 			return fmt.Errorf("写入下载文件失败: %w", copyErr)
@@ -1863,6 +1978,15 @@ func (e *Engine) pullFileFromRemote(ctx context.Context, cfg config.Config, rem 
 	actualHash := hex.EncodeToString(hasher.Sum(nil))
 	if rem.SHA256 != "" && !strings.EqualFold(rem.SHA256, actualHash) {
 		_ = os.Remove(tmpPath)
+		// A digest mismatch usually means the body was truncated or corrupted
+		// in transit. That is worth one clean retry before surfacing an error;
+		// the log showed the same file failing repeatedly otherwise, because
+		// the next attempt re-read the same edge response.
+		if !retried {
+			retried = true
+			e.index.SetFileStatus(rel, StatusPending, "校验失败重试")
+			return e.pullFileFromRemoteRetry(ctx, cfg, rem, saveConflict)
+		}
 		e.index.SetFileStatus(rel, StatusError, "下载失败")
 		return fmt.Errorf("下载文件哈希校验失败 (%s)", rel)
 	}
@@ -1872,13 +1996,13 @@ func (e *Engine) pullFileFromRemote(ctx context.Context, cfg config.Config, rem 
 		if existingInfo, statErr := os.Stat(fullPath); statErr == nil && existingInfo.Mode().IsRegular() {
 			existingHash, hashErr := HashFile(fullPath)
 			if hashErr == nil && existingHash != "" && existingHash != actualHash {
-				backupPath := ConflictBackupPath(fullPath)
-				if err := copyFileContents(fullPath, backupPath); err == nil {
-					conflictCreated = true
-					e.incrementConflict()
-					e.Logf("冲突保护: 已保存本地冲突副本 %s", filepath.Base(backupPath))
-				} else {
-					e.LogThrottled("conflict:"+backupPath+":"+err.Error(), "WARN", fmt.Sprintf("保存冲突副本失败 (%s): %v", filepath.Base(backupPath), err), 30*time.Second)
+				// Back the local file up only when the peer does not already
+				// hold this exact content. An interrupted download leaves the
+				// old copy in place; retrying it used to back that copy up on
+				// every attempt, filling folders with identical .conflict-
+				// files that carry no information the peer lacks.
+				if e.index.IsDirty(rel) {
+					conflictCreated = e.saveConflictCopy(rel, fullPath)
 				}
 			}
 		}
@@ -1918,22 +2042,38 @@ func (e *Engine) pullFileFromRemote(ctx context.Context, cfg config.Config, rem 
 	e.index.RequestSave()
 
 	e.recordDownload(rel, written, time.Since(start))
-	e.markSyncedActivity(fmt.Sprintf("已下载同步: %s (%s)", rel, FormatBytes(written)))
+	e.noteSynced("已下载同步", rel, written)
 	return nil
+}
+
+// saveConflictCopy preserves a differing local file before it is overwritten.
+func (e *Engine) saveConflictCopy(rel, fullPath string) bool {
+	backupPath := ConflictBackupPath(fullPath)
+	if err := copyFileContents(fullPath, backupPath); err != nil {
+		e.LogThrottled("conflict:"+backupPath+":"+err.Error(), "WARN", fmt.Sprintf("保存冲突副本失败 (%s): %v", filepath.Base(backupPath), err), 30*time.Second)
+		return false
+	}
+	e.incrementConflict()
+	e.Logf("冲突保护: 已保存本地冲突副本 %s", filepath.Base(backupPath))
+	return true
 }
 
 // replaceFile atomically renames tmpPath over fullPath. It never removes the
 // existing destination first: on a transient sharing violation the previous
 // file stays intact and the caller reports the error.
 func replaceFile(tmpPath, fullPath string) error {
-	err := os.Rename(tmpPath, fullPath)
-	if err == nil {
-		return nil
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		err = os.Rename(tmpPath, fullPath)
+		if err == nil {
+			return nil
+		}
+		// Windows antivirus and the search indexer briefly hold freshly
+		// written files as well as the destination. Back off a few times
+		// before treating it as a real failure.
+		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
 	}
-	// Windows antivirus/indexers can briefly hold the destination; one retry
-	// resolves most cases without risking data loss.
-	time.Sleep(25 * time.Millisecond)
-	return os.Rename(tmpPath, fullPath)
+	return err
 }
 
 func (e *Engine) pushFileToRemote(ctx context.Context, cfg config.Config, loc FileMeta, baseHash string) error {
@@ -1988,31 +2128,21 @@ func (e *Engine) pushFileToRemote(ctx context.Context, cfg config.Config, loc Fi
 	e.notifyUI()
 
 	baseURL := config.NormalizeRemoteURL(cfg.RemoteURL)
-	u := fmt.Sprintf(
-		"%s/api/file?path=%s&mtime=%d&sha256=%s&base_hash=%s",
-		baseURL,
-		url.QueryEscape(rel),
-		mtime,
-		url.QueryEscape(hash),
-		url.QueryEscape(baseHash),
-	)
-	transferCtx, cancel := context.WithTimeout(ctx, transferTimeout(size))
-	defer cancel()
-	body := &progressReader{r: f, onMove: e.countUploadBytes}
-	req, err := http.NewRequestWithContext(transferCtx, http.MethodPut, u, body)
+	var resp *http.Response
+	if size > maxUploadChunkBytes {
+		// A single request this large is rejected by the tunnel edge (413) or
+		// times out there (524), so send it in parts that also allow a resume.
+		resp, err = e.uploadChunked(ctx, cfg, baseURL, f, rel, size, mtime, hash, baseHash)
+	} else {
+		resp, err = e.uploadSingle(ctx, cfg, baseURL, f, rel, size, mtime, hash, baseHash)
+	}
 	if err != nil {
+		if transferCanceled(ctx, err) {
+			e.index.SetFileStatus(rel, StatusPending, "等待重试")
+			return context.Canceled
+		}
 		e.index.SetFileStatus(rel, StatusError, "上传失败")
 		return err
-	}
-	req.ContentLength = size
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-SyncT-Token", cfg.AuthToken)
-	req.Header.Set("X-SyncT-Node", e.index.NodeID())
-
-	resp, err := e.transfer.Do(req)
-	if err != nil {
-		e.index.SetFileStatus(rel, StatusError, "上传失败")
-		return fmt.Errorf("上传请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -2029,13 +2159,242 @@ func (e *Engine) pushFileToRemote(ctx context.Context, cfg config.Config, loc Fi
 			}
 			e.requestScan(scanID, false, "哈希校验失败重扫")
 		}
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		if resp.StatusCode == http.StatusRequestEntityTooLarge {
+			e.noteLargeUploadBlocked()
+			return remoteStatusError("上传文件", resp.StatusCode, string(body))
+		}
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, cleanHTTPBody(string(body)))
 	}
 
 	e.index.MarkFileSynced(loc, StatusSynced, "本地 -> 远端")
 	e.index.RequestSave()
 	e.recordUpload(rel, size, time.Since(start))
-	e.markSyncedActivity(fmt.Sprintf("已上传同步: %s (%s)", rel, FormatBytes(size)))
+	e.noteSynced("已上传同步", rel, size)
+	return nil
+}
+
+// uploadSingle sends one file as a single PUT. Small files stay one request:
+// paying chunk setup for a 40 KB file would cost more than it saves.
+func (e *Engine) uploadSingle(ctx context.Context, cfg config.Config, baseURL string, f *os.File, rel string, size, mtime int64, hash, baseHash string) (*http.Response, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("重置文件读取位置失败: %w", err)
+	}
+	u := fmt.Sprintf(
+		"%s/api/file?path=%s&mtime=%d&sha256=%s&base_hash=%s",
+		baseURL,
+		url.QueryEscape(rel),
+		mtime,
+		url.QueryEscape(hash),
+		url.QueryEscape(baseHash),
+	)
+	transferCtx, cancel := context.WithTimeout(ctx, transferTimeout(size))
+	defer cancel()
+	body := &progressReader{r: f, onMove: e.countUploadBytes}
+	req, err := http.NewRequestWithContext(transferCtx, http.MethodPut, u, body)
+	if err != nil {
+		return nil, err
+	}
+	req.ContentLength = size
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-SyncT-Token", cfg.AuthToken)
+	req.Header.Set("X-SyncT-Node", e.index.NodeID())
+	resp, err := e.transfer.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("上传请求失败: %w", err)
+	}
+	return resp, nil
+}
+
+// uploadChunked posts the file in ≤8 MB parts. Each part finishes well inside
+// the edge's body limit and its 100-second origin timeout; a retry asks the
+// origin how much it already has and resumes there instead of starting over.
+func (e *Engine) uploadChunked(ctx context.Context, cfg config.Config, baseURL string, f *os.File, rel string, size, mtime int64, hash, baseHash string) (*http.Response, error) {
+	session, err := e.beginChunkedUpload(ctx, cfg, baseURL, rel, size, mtime, hash, baseHash, "")
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, maxUploadChunkBytes)
+	chunkSize := int64(maxUploadChunkBytes)
+	const minChunkSize = int64(1 << 20)
+	var lastChunkErr error
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			_ = e.abortChunkedUpload(cfg, baseURL, session.UploadID)
+			return nil, ctx.Err()
+		}
+		offset := session.Received
+		for offset < size {
+			n := chunkSize
+			if size-offset < n {
+				n = size - offset
+			}
+			// Seek for every attempt: a rejected part is retried at the same
+			// offset with a smaller size, and the previous read left the file
+			// position at its end.
+			if _, err := f.Seek(offset, io.SeekStart); err != nil {
+				_ = e.abortChunkedUpload(cfg, baseURL, session.UploadID)
+				return nil, fmt.Errorf("重置文件读取位置失败: %w", err)
+			}
+			if _, err := io.ReadFull(f, buf[:n]); err != nil {
+				_ = e.abortChunkedUpload(cfg, baseURL, session.UploadID)
+				return nil, fmt.Errorf("读取文件失败: %w", err)
+			}
+			next, err := e.sendChunk(ctx, cfg, baseURL, session.UploadID, offset, buf[:n])
+			if err != nil {
+				lastChunkErr = err
+				// The edge's body cap can be lower than ours (a zone or proxy
+				// setting, or a build using a different limit). Halve the part
+				// and retry the same offset until it fits.
+				if errors.Is(err, errTooLarge) && chunkSize > minChunkSize {
+					chunkSize /= 2
+					if chunkSize < minChunkSize {
+						chunkSize = minChunkSize
+					}
+					continue
+				}
+				break
+			}
+			e.countUploadBytes(next.Received - offset)
+			offset = next.Received
+		}
+		session.Received = offset
+		if offset >= size {
+			break
+		}
+		if attempt >= 2 {
+			_ = e.abortChunkedUpload(cfg, baseURL, session.UploadID)
+			if lastChunkErr != nil {
+				return nil, fmt.Errorf("分块上传多次中断，已放弃本次上传 (%s): %w", rel, lastChunkErr)
+			}
+			return nil, fmt.Errorf("分块上传多次中断，已放弃本次上传 (%s)", rel)
+		}
+		// Ask the origin for its durable offset; a lost connection may have
+		// delivered a chunk whose acknowledgment never arrived.
+		resumed, err := e.beginChunkedUpload(ctx, cfg, baseURL, rel, size, mtime, hash, baseHash, session.UploadID)
+		if err != nil {
+			return nil, err
+		}
+		if resumed.Received == 0 && resumed.UploadID == "" {
+			resumed, err = e.beginChunkedUpload(ctx, cfg, baseURL, rel, size, mtime, hash, baseHash, "")
+			if err != nil {
+				return nil, err
+			}
+		}
+		session = resumed
+	}
+
+	body, _ := json.Marshal(map[string]string{"upload_id": session.UploadID})
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+"/api/upload/commit?id="+url.QueryEscape(session.UploadID), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-SyncT-Token", cfg.AuthToken)
+	req.Header.Set("X-SyncT-Node", e.index.NodeID())
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("提交分块上传失败: %w", err)
+	}
+	return resp, nil
+}
+
+func (e *Engine) beginChunkedUpload(ctx context.Context, cfg config.Config, baseURL, rel string, size, mtime int64, hash, baseHash, uploadID string) (uploadBeginResponse, error) {
+	var out uploadBeginResponse
+	payload, err := json.Marshal(uploadBeginRequest{
+		Path: rel, Size: size, ModTime: mtime, SHA256: hash, BaseHash: baseHash, UploadID: uploadID,
+	})
+	if err != nil {
+		return out, err
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+"/api/upload/begin", bytes.NewReader(payload))
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("X-SyncT-Token", cfg.AuthToken)
+	req.Header.Set("X-SyncT-Node", e.index.NodeID())
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return out, fmt.Errorf("开始分块上传失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		// The peer still runs a build without the chunked endpoints, so any
+		// file over the tunnel's cap is impossible to send.
+		e.noteLargeUploadBlocked()
+		return out, fmt.Errorf("对端版本过旧，不支持分块上传: HTTP %d", resp.StatusCode)
+	}
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		e.noteLargeUploadBlocked()
+		return out, fmt.Errorf("开始分块上传失败: %w", errTooLarge)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return out, fmt.Errorf("开始分块上传失败: HTTP %d %s", resp.StatusCode, cleanHTTPBody(string(body)))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, fmt.Errorf("解析分块上传会话失败: %w", err)
+	}
+	if out.UploadID == "" {
+		return out, errors.New("分块上传会话为空")
+	}
+	e.ClearLargeUploadBlocked()
+	return out, nil
+}
+
+func (e *Engine) sendChunk(ctx context.Context, cfg config.Config, baseURL, id string, offset int64, data []byte) (uploadBeginResponse, error) {
+	var out uploadBeginResponse
+	u := fmt.Sprintf("%s/api/upload/chunk?id=%s&offset=%d", baseURL, url.QueryEscape(id), offset)
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, u, bytes.NewReader(data))
+	if err != nil {
+		return out, err
+	}
+	req.ContentLength = int64(len(data))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-SyncT-Token", cfg.AuthToken)
+	req.Header.Set("X-SyncT-Node", e.index.NodeID())
+	resp, err := e.transfer.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return out, errors.New("分块上传会话已失效")
+	}
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return out, fmt.Errorf("分块被拒绝: %w", errTooLarge)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return out, fmt.Errorf("发送分块失败: HTTP %d %s", resp.StatusCode, cleanHTTPBody(string(body)))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, fmt.Errorf("解析分块响应失败: %w", err)
+	}
+	return out, nil
+}
+
+func (e *Engine) abortChunkedUpload(cfg config.Config, baseURL, id string) error {
+	if id == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/upload/abort?id="+url.QueryEscape(id), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-SyncT-Token", cfg.AuthToken)
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
 	return nil
 }
 
@@ -2106,27 +2465,28 @@ func (e *Engine) Stats() Stats {
 	now := time.Now()
 	e.mu.RLock()
 	st := Stats{
-		State:           e.state,
-		LastError:       e.lastError,
-		LocalPort:       e.localPort,
-		HealthWarning:   e.healthWarning,
-		ConnectedPeers:  e.server.ConnectedPeers(),
-		RemoteConnected: e.remoteConnected,
-		RemoteNodeID:    e.remoteNodeID,
-		FolderCount:     e.cfg.EnabledFolderCount(),
-		BytesUploaded:   e.bytesUploaded.Load(),
-		BytesDownloaded: e.bytesDownloaded.Load(),
-		UploadSpeed:     e.uploadMeter.rate(now),
-		DownloadSpeed:   e.downloadMeter.rate(now),
-		LastSyncFile:    e.lastSyncFile,
-		LastSyncBytes:   e.lastSyncBytes,
-		SyncedEvents:    e.syncedEvents.Load(),
-		ConflictsSaved:  e.conflictsSaved.Load(),
-		LastSyncTime:    e.lastSyncTime,
-		LastScanTime:    e.lastScanTime,
-		LastScanError:   e.lastScanError,
-		ScanErrors:      e.scanErrors.Load(),
-		TLSRejected:     e.tlsRejected.Load(),
+		State:              e.state,
+		LastError:          e.lastError,
+		LocalPort:          e.localPort,
+		HealthWarning:      e.healthWarning,
+		ConnectedPeers:     e.server.ConnectedPeers(),
+		RemoteConnected:    e.remoteConnected,
+		RemoteNodeID:       e.remoteNodeID,
+		FolderCount:        e.cfg.EnabledFolderCount(),
+		BytesUploaded:      e.bytesUploaded.Load(),
+		BytesDownloaded:    e.bytesDownloaded.Load(),
+		UploadSpeed:        e.uploadMeter.rate(now),
+		DownloadSpeed:      e.downloadMeter.rate(now),
+		LastSyncFile:       e.lastSyncFile,
+		LastSyncBytes:      e.lastSyncBytes,
+		SyncedEvents:       e.syncedEvents.Load(),
+		ConflictsSaved:     e.conflictsSaved.Load(),
+		LastSyncTime:       e.lastSyncTime,
+		LastScanTime:       e.lastScanTime,
+		LastScanError:      e.lastScanError,
+		ScanErrors:         e.scanErrors.Load(),
+		TLSRejected:        e.tlsRejected.Load(),
+		LargeUploadBlocked: e.largeBlocked.Load(),
 	}
 	e.mu.RUnlock()
 
@@ -2241,8 +2601,17 @@ func (e *Engine) setScanFailure(err error) {
 //     disagree (stale ingress, wrong port, recreated tunnel); a 502 while the
 //     local listener is dead is repaired by rebinding the origin.
 func (e *Engine) hostHealthLoop(ctx context.Context, port int) {
-	localTicker := time.NewTicker(hostHealthInterval)
-	publicTicker := time.NewTicker(publicProbeInterval)
+	e.mu.RLock()
+	localEvery, publicEvery := e.hostHealthEvery, e.publicProbeEvery
+	e.mu.RUnlock()
+	if localEvery <= 0 {
+		localEvery = hostHealthInterval
+	}
+	if publicEvery <= 0 {
+		publicEvery = publicProbeInterval
+	}
+	localTicker := time.NewTicker(localEvery)
+	publicTicker := time.NewTicker(publicEvery)
 	defer localTicker.Stop()
 	defer publicTicker.Stop()
 
@@ -2441,12 +2810,90 @@ func (e *Engine) incrementConflict() {
 	e.conflictsSaved.Add(1)
 }
 
+func (e *Engine) noteSynced(verb, relPath string, n int64) {
+	now := time.Now()
+	e.syncedEvents.Add(1)
+	e.mu.Lock()
+	e.lastSyncTime = now
+	e.lastSyncFile = relPath
+	e.lastSyncBytes = n
+	e.mu.Unlock()
+	e.activityMu.Lock()
+	b := e.activities[verb]
+	if b == nil {
+		b = &activityBucket{first: now}
+		e.activities[verb] = b
+	}
+	b.count++
+	b.bytes += n
+	b.last = relPath
+	e.activityMu.Unlock()
+	e.throttledNotifyUI()
+}
+
+// flushActivities writes one line per direction for every transfer that
+// completed since the last call, with the batch size, duration and average.
+func (e *Engine) flushActivities() {
+	e.activityMu.Lock()
+	if len(e.activities) == 0 {
+		e.activityMu.Unlock()
+		return
+	}
+	buckets := e.activities
+	e.activities = make(map[string]*activityBucket)
+	e.activityMu.Unlock()
+
+	now := time.Now()
+	verbs := make([]string, 0, len(buckets))
+	for verb := range buckets {
+		verbs = append(verbs, verb)
+	}
+	sort.Strings(verbs)
+	for _, verb := range verbs {
+		b := buckets[verb]
+		if b.count <= 1 {
+			e.LogLevel("SYNC", fmt.Sprintf("%s: %s (%s)", verb, b.last, FormatBytes(b.bytes)))
+			continue
+		}
+		dur := now.Sub(b.first)
+		if dur <= 0 {
+			dur = time.Millisecond
+		}
+		rate := int64(float64(b.bytes) / dur.Seconds())
+		e.LogLevel("SYNC", fmt.Sprintf("%s: %d 个文件 (%s)，用时 %s，平均 %s，最近 %s",
+			verb, b.count, FormatBytes(b.bytes), dur.Round(100*time.Millisecond), FormatSpeed(rate), b.last))
+	}
+}
+
 func (e *Engine) markSyncedActivity(msg string) {
 	e.syncedEvents.Add(1)
 	e.mu.Lock()
 	e.lastSyncTime = time.Now()
 	e.mu.Unlock()
 	e.LogLevel("SYNC", msg)
+}
+
+func (e *Engine) noteLargeUploadBlocked() {
+	if e.largeBlocked.Swap(true) {
+		return
+	}
+	e.setHealthWarning("有文件因大小被隧道拒绝：对端 SyncT 版本较旧，不支持分块上传。请把两端都升级到 v1.3.0 或更新版本。")
+	e.notifyUI()
+}
+
+// ClearLargeUploadBlocked drops the warning once a large upload succeeds.
+func (e *Engine) ClearLargeUploadBlocked() {
+	if e.largeBlocked.CompareAndSwap(true, false) {
+		e.clearHealthWarning()
+	}
+}
+
+// NoteResyncFailure records a transfer that failed and will be retried. It is
+// an error the index shows as 待同步, but the user needs it once, not once per
+// scan: the throttle key is the message, so a 413 storm collapses to a line.
+func (e *Engine) NoteResyncFailure(relPath string, err error) {
+	e.LogThrottled("resync:"+relPath+":"+err.Error(), "WARN",
+		fmt.Sprintf("同步失败，将自动重试 %s: %v", relPath, err), 5*time.Minute)
 }
 
 func (e *Engine) notifyUI() {
@@ -2461,11 +2908,17 @@ func (e *Engine) notifyUI() {
 func (e *Engine) telemetryLoop(ctx context.Context) {
 	ticker := time.NewTicker(notifyUIInterval)
 	defer ticker.Stop()
+	lastFlush := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
+			e.flushActivities()
 			return
 		case <-ticker.C:
+			if time.Since(lastFlush) >= time.Second {
+				e.flushActivities()
+				lastFlush = time.Now()
+			}
 			e.notifyUI()
 		}
 	}

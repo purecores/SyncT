@@ -58,6 +58,9 @@ func TestServerRefusesSilentPortFallback(t *testing.T) {
 }
 
 func TestOriginHealthLoopRebindsDeadListener(t *testing.T) {
+	// The engine copies these into per-engine fields as it is constructed, so
+	// changing them before startTestHost is deterministic and no goroutine
+	// reads the package variables afterwards.
 	oldLocal, oldPublic := hostHealthInterval, publicProbeInterval
 	hostHealthInterval = 100 * time.Millisecond
 	publicProbeInterval = time.Hour

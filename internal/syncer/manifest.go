@@ -51,7 +51,11 @@ type FileMeta struct {
 	RelPath  string `json:"rel_path"`            // Virtual relative path ("file.txt" for default, "@<id>/file.txt" for mapped folders)
 	Size     int64  `json:"size"`
 	ModTime  int64  `json:"mod_time"` // Unix milliseconds (UTC)
-	SHA256   string `json:"sha256"`
+	// SeenAt is when this node first indexed this content (Unix milliseconds).
+	// Modification time alone cannot protect a file restored from a backup:
+	// it keeps its old mtime while the peer may hold a newer deletion record.
+	SeenAt int64  `json:"seen_at,omitempty"`
+	SHA256 string `json:"sha256"`
 }
 
 // DirMeta is one directory inside a synced folder. Directories are tracked so
@@ -272,6 +276,7 @@ type IndexStore struct {
 	statuses     map[string]FileStatus
 	statusCounts map[FileStatus]int
 	directions   map[string]string
+	dirty        map[string]struct{} // local content the peer may not have yet
 	addedDirs    []DirMeta
 	// newFilesPending marks newly scanned files 待同步 until a transfer
 	// confirms them. The host serves its files directly, so only a client
@@ -315,6 +320,7 @@ type persistedState struct {
 	NodeID      string               `json:"node_id"`
 	Files       map[string]FileMeta  `json:"files"`
 	Dirs        map[string]DirMeta   `json:"dirs,omitempty"`
+	Dirty       map[string]bool      `json:"dirty,omitempty"`
 	Tombstones  map[string]Tombstone `json:"tombstones"`
 	FolderRoots map[string]string    `json:"folder_roots,omitempty"`
 	SavedAt     int64                `json:"saved_at,omitempty"`
@@ -331,6 +337,7 @@ func NewIndexStore(statePath string) *IndexStore {
 		statuses:      make(map[string]FileStatus),
 		statusCounts:  make(map[FileStatus]int),
 		directions:    make(map[string]string),
+		dirty:         make(map[string]struct{}),
 		folderStats:   make(map[string]folderStat),
 		folderRoots:   make(map[string]string),
 		pendingWrites: make(map[string]struct{}),
@@ -383,6 +390,11 @@ func (s *IndexStore) load() {
 	}
 	if ps.Dirs != nil && len(ps.Dirs) > 0 {
 		s.dirs = ps.Dirs
+	}
+	for rel, dirty := range ps.Dirty {
+		if dirty {
+			s.dirty[rel] = struct{}{}
+		}
 	}
 	if ps.Tombstones != nil && len(ps.Tombstones) > 0 {
 		s.tombstones = ps.Tombstones
@@ -464,6 +476,7 @@ func (s *IndexStore) saveNow() error {
 		NodeID:      s.nodeID,
 		Files:       make(map[string]FileMeta, len(s.files)),
 		Dirs:        make(map[string]DirMeta, len(s.dirs)),
+		Dirty:       make(map[string]bool, len(s.dirty)),
 		Tombstones:  make(map[string]Tombstone, len(s.tombstones)),
 		FolderRoots: make(map[string]string, len(s.folderRoots)),
 		SavedAt:     time.Now().UTC().UnixMilli(),
@@ -473,6 +486,9 @@ func (s *IndexStore) saveNow() error {
 	}
 	for k, v := range s.dirs {
 		ps.Dirs[k] = v
+	}
+	for k := range s.dirty {
+		ps.Dirty[k] = true
 	}
 	for k, v := range s.tombstones {
 		ps.Tombstones[k] = v
@@ -817,6 +833,7 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 				RelPath:  job.virtualRel,
 				Size:     job.size,
 				ModTime:  job.mtime,
+				SeenAt:   time.Now().UTC().UnixMilli(),
 				SHA256:   outcome.hash,
 			}
 			seen[job.virtualRel] = meta
@@ -891,6 +908,7 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 		delete(s.files, rel)
 		s.deleteStatusLocked(rel)
 		delete(s.directions, rel)
+		delete(s.dirty, rel)
 		if matcher.Match(inner, false) {
 			// Newly ignored files are dropped without a deletion event.
 			continue
@@ -910,22 +928,38 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 	// serves its own files directly and can never upload to a client, so its
 	// local files count as synced; a client that may push does not.
 	pendingSet := make(map[string]struct{}, len(changed))
-	if s.newFilesPending {
-		for _, meta := range changed {
-			pendingSet[meta.RelPath] = struct{}{}
-		}
+	for _, meta := range changed {
+		pendingSet[meta.RelPath] = struct{}{}
 	}
 	for rel, meta := range seen {
+		prev, hadPrev := s.files[rel]
 		s.files[rel] = meta
 		s.ensureStatusLocked(rel)
 		if _, isNewOrChanged := pendingSet[rel]; isNewOrChanged {
-			s.markPendingLocked(rel)
+			s.dirty[rel] = struct{}{}
+			if s.newFilesPending {
+				s.markPendingLocked(rel)
+			}
 		}
 		if _, ok := s.directions[rel]; !ok {
 			s.directions[rel] = "本地"
 		}
-		if tomb, hasTomb := s.tombstones[rel]; hasTomb && meta.ModTime >= tomb.DeletedAt {
-			delete(s.tombstones, rel)
+		// A tombstone only yields to an edit made after the delete. A file
+		// restored from a backup or copied from an archive keeps its old
+		// modification time, so comparing mtime alone would let a peer's newer
+		// deletion erase it silently. SeenAt records when this node first saw
+		// the content, which is after the delete in that case.
+		if tomb, hasTomb := s.tombstones[rel]; hasTomb {
+			firstSeen := meta.SeenAt
+			if hadPrev && prev.SeenAt > 0 {
+				firstSeen = prev.SeenAt
+			}
+			if firstSeen == 0 {
+				firstSeen = now
+			}
+			if effectiveMTimeWithSeen(meta, firstSeen) >= tomb.DeletedAt {
+				delete(s.tombstones, rel)
+			}
 		}
 	}
 
@@ -1083,12 +1117,18 @@ func (s *IndexStore) MarkFileSynced(meta FileMeta, status FileStatus, direction 
 	if meta.FolderID == "" {
 		meta.FolderID, _ = SplitFolderRelPath(meta.RelPath)
 	}
+	if meta.SeenAt == 0 {
+		meta.SeenAt = time.Now().UTC().UnixMilli()
+	}
 	meta.FolderID = config.NormalizeFolderID(meta.FolderID)
 	s.mu.Lock()
 	prev, existed := s.files[meta.RelPath]
 	s.files[meta.RelPath] = meta
 	delete(s.tombstones, meta.RelPath)
 	s.setStatusLocked(meta.RelPath, status)
+	if status == StatusSynced || status == StatusConflict {
+		delete(s.dirty, meta.RelPath)
+	}
 	if direction != "" {
 		s.directions[meta.RelPath] = direction
 	}
@@ -1118,6 +1158,9 @@ func (s *IndexStore) SetFileStatus(relPath string, status FileStatus, direction 
 	if _, ok := s.files[relPath]; ok {
 		changed := s.statuses[relPath] != status || (direction != "" && s.directions[relPath] != direction)
 		s.setStatusLocked(relPath, status)
+		if status == StatusSynced {
+			delete(s.dirty, relPath)
+		}
 		if direction != "" {
 			s.directions[relPath] = direction
 		}
@@ -1136,6 +1179,7 @@ func (s *IndexStore) MarkFileDeleted(relPath string, deletedAt int64) Tombstone 
 	delete(s.files, relPath)
 	s.deleteStatusLocked(relPath)
 	delete(s.directions, relPath)
+	delete(s.dirty, relPath)
 	delete(s.pendingWrites, relPath)
 	if existed {
 		st := s.folderStats[fid]
@@ -1394,6 +1438,24 @@ func (s *IndexStore) DirCount() int {
 	return n
 }
 
+// IsDirty reports whether the local file has content the peer may not hold.
+// The dirty marker is set by a scan that sees a new or changed file and is
+// cleared by a completed transfer, so it survives a restart without storing a
+// second digest for every file in the index.
+func (s *IndexStore) IsDirty(relPath string) bool {
+	s.mu.RLock()
+	_, dirty := s.dirty[relPath]
+	s.mu.RUnlock()
+	return dirty
+}
+
+// ClearDirty records that the peer now holds this path's content.
+func (s *IndexStore) ClearDirty(relPath string) {
+	s.mu.Lock()
+	delete(s.dirty, relPath)
+	s.mu.Unlock()
+}
+
 // UnsyncedCount reports how many indexed files have not been confirmed on the
 // peer yet (pending, transferring, failed or conflicted).
 func (s *IndexStore) UnsyncedCount() int {
@@ -1448,6 +1510,7 @@ func (s *IndexStore) removeInactiveFoldersLocked(active map[string]struct{}) {
 		delete(s.files, rel)
 		s.deleteStatusLocked(rel)
 		delete(s.directions, rel)
+		delete(s.dirty, rel)
 		st := s.folderStats[fid]
 		st.files--
 		st.bytes -= prev.Size
@@ -1521,6 +1584,19 @@ func isPathWithinRoot(root, p string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// effectiveTime is the later of a file's modification time and the moment
+// this node first saw that content. A restored file can carry an old mtime,
+// so a peer deletion newer than the mtime alone must not silently erase it.
+func effectiveTime(meta FileMeta) int64 {
+	return max64(meta.ModTime, meta.SeenAt)
+}
+
+// effectiveMTimeWithSeen is effectiveTime for a freshly indexed entry whose
+// persisted SeenAt may not have been loaded yet.
+func effectiveMTimeWithSeen(meta FileMeta, seenAt int64) int64 {
+	return max64(meta.ModTime, seenAt)
 }
 
 func abs64(n int64) int64 {

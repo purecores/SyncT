@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"log"
@@ -25,7 +26,7 @@ import (
 )
 
 // SyncTProtocolVersion is reported by /api/status for compatibility checks.
-const SyncTProtocolVersion = "1.2.1"
+const SyncTProtocolVersion = "1.3.0"
 
 // SyncEventType identifies the kind of real-time change broadcast over SSE.
 type SyncEventType string
@@ -74,13 +75,46 @@ type Server struct {
 
 	subsMu sync.Mutex
 	subs   map[chan SyncEvent]*subscriber
+
+	uploadsMu sync.Mutex
+	uploads   map[string]*chunkUpload
 }
+
+// chunkUpload is one resumable upload assembled from several requests. The
+// temporary file lives under the folder's .synct-uploads directory, so a
+// final rename stays on the same volume and scans ignore it.
+type chunkUpload struct {
+	mu         sync.Mutex
+	id         string
+	key        string
+	relPath    string
+	fullPath   string
+	tmpPath    string
+	size       int64
+	mtime      int64
+	expected   string
+	baseHash   string
+	originNode string
+	received   int64
+	hasher     hash.Hash
+	createdAt  time.Time
+	lastActive time.Time
+	done       bool
+}
+
+const (
+	// maxUploadChunkBytes stays well inside what a Cloudflare-proxied request
+	// can carry and what finishes comfortably under its ~100s origin timeout.
+	maxUploadChunkBytes = 8 << 20
+	uploadSessionTTL    = 45 * time.Minute
+)
 
 // NewServer constructs a sync HTTP server attached to the Engine.
 func NewServer(engine *Engine) *Server {
 	return &Server{
-		engine: engine,
-		subs:   make(map[chan SyncEvent]*subscriber),
+		engine:  engine,
+		subs:    make(map[chan SyncEvent]*subscriber),
+		uploads: make(map[string]*chunkUpload),
 	}
 }
 
@@ -92,6 +126,8 @@ func (s *Server) Start(port int, allowLAN bool) (int, error) {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
 	s.stopped.Store(false)
+	// Staging directories left by an earlier crash belong to no live session.
+	go s.cleanupUploadDirs()
 	return s.startLocked(port, allowLAN)
 }
 
@@ -157,6 +193,10 @@ func (s *Server) startLocked(port int, allowLAN bool) (int, error) {
 	mux.HandleFunc("/api/status", s.withAuth(s.handleStatus))
 	mux.HandleFunc("/api/manifest", s.withAuth(s.handleManifest))
 	mux.HandleFunc("/api/file", s.withAuth(s.handleFile))
+	mux.HandleFunc("/api/upload/begin", s.withAuth(s.handleUploadBegin))
+	mux.HandleFunc("/api/upload/chunk", s.withAuth(s.handleUploadChunk))
+	mux.HandleFunc("/api/upload/commit", s.withAuth(s.handleUploadCommit))
+	mux.HandleFunc("/api/upload/abort", s.withAuth(s.handleUploadAbort))
 	mux.HandleFunc("/api/dirs", s.withAuth(s.handleDirs))
 	mux.HandleFunc("/api/events", s.withAuth(s.handleEvents))
 
@@ -164,7 +204,12 @@ func (s *Server) startLocked(port int, allowLAN bool) (int, error) {
 		Handler:           mux,
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		// Chunked uploads are many small requests; a generous per-request
+		// timeout keeps a slow 8 MB part alive without letting a stalled one
+		// hold a connection forever.
+		ReadTimeout:    10 * time.Minute,
+		WriteTimeout:   10 * time.Minute,
+		MaxHeaderBytes: 1 << 20,
 		// Cloudflared's origin TLS errors used to go to a stderr nobody reads
 		// in a windowsgui build. Route them into the visible log; a rejected
 		// self-signed certificate is the direct cause of a public 502.
@@ -268,6 +313,7 @@ func (s *Server) IsServing() bool {
 func (s *Server) Stop() {
 	s.stopped.Store(true)
 	s.serving.Store(false)
+	s.abortAllUploads()
 
 	s.subsMu.Lock()
 	for ch, sub := range s.subs {
@@ -618,7 +664,7 @@ func (s *Server) serveFileUpload(w http.ResponseWriter, r *http.Request, cfg con
 	s.engine.index.RequestSave()
 
 	s.engine.recordDownload(relPath, written, time.Since(start))
-	s.engine.markSyncedActivity(fmt.Sprintf("接收文件更新: %s (%s)", relPath, FormatBytes(written)))
+	s.engine.noteSynced("接收文件", relPath, written)
 
 	s.Broadcast(SyncEvent{
 		Type:       EventUpsert,
