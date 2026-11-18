@@ -13,7 +13,7 @@ import (
 
 // AppVersion is the version stamped into the executable's resources. Bump it
 // with the release tag so Windows' file properties match the published build.
-const AppVersion = "1.3.0"
+const AppVersion = "1.3.1"
 
 var windowsIconSizes = []int{16, 24, 32, 48, 64, 128, 256}
 
@@ -239,7 +239,7 @@ func resizeImage(img image.Image, size int) *image.NRGBA {
 func buildAsInvokerManifest() string {
 	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="cyou.suosmanthus.synctreei" version="1.3.0.0" processorArchitecture="*"/>
+  <assemblyIdentity type="win32" name="cyou.suosmanthus.synctreei" version="1.3.1.0" processorArchitecture="*"/>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
@@ -314,8 +314,8 @@ func buildVersionInfo() []byte {
 
 	var table []verNode
 	for _, s := range [][2]string{
-		{"CompanyName", "SyncT Portable"},
-		{"FileDescription", "SyncT — Cloudflared Portable Folder Sync (synctreei.suosmanthus.cyou)"},
+		{"CompanyName", "SyncT"},
+		{"FileDescription", "SyncT"},
 		{"FileVersion", AppVersion},
 		{"InternalName", "SyncT.exe"},
 		{"OriginalFilename", "SyncT.exe"},

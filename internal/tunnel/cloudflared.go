@@ -18,6 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"synct/internal/applog"
+
 	"github.com/egoist/mygo/netproxy"
 
 	"synct/internal/config"
@@ -720,6 +722,7 @@ func (m *Manager) DownloadPortableBinary(onDone func(path string, err error)) {
 }
 
 func (m *Manager) appendLog(line string) {
+	applog.Write("TUNNEL", line)
 	stamp := time.Now().Format("15:04:05")
 	entry := fmt.Sprintf("[%s] %s", stamp, line)
 	m.mu.Lock()

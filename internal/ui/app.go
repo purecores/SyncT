@@ -63,14 +63,15 @@ type App struct {
 	win    *mygo.Window
 
 	// Navigation & Layout
-	section    string
-	navOpen    bool
-	toolsOpen  bool
-	roleIndex  int
-	logTab     int
-	portInput  string
-	shareInput string
-	showToken  bool
+	section       string
+	navOpen       bool
+	toolsOpen     bool
+	roleIndex     int
+	logTab        int
+	portInput     string
+	shareInput    string
+	showToken     bool
+	passwordInput string
 
 	// statusBarNoticeSeen mirrors the status bar toggle so a click there is
 	// persisted and confirmed, exactly as the settings page does.
@@ -368,7 +369,7 @@ func (app *App) View(c *ui.Context) {
 	stats := app.engine.Stats()
 	app.sampleSpeeds(stats)
 
-	root := ui.Column(c).Fill().Background(t.Background)
+	root := ui.Column(c).Fill().Background(t.Background).Selectable()
 	if paths := root.DroppedFiles(); len(paths) > 0 {
 		count, err := app.engine.ImportFiles(paths)
 		if err != nil {
@@ -438,8 +439,7 @@ func (app *App) buildHeader(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
 			ui.Icon(c, IconCloud).TextColor(t.Accent)
 		}
 		ui.Column(c).Gap(0).Children(func() {
-			ui.Text(c, "SyncT").FontSize(t.Rem(1.02)).Bold()
-			ui.Text(c, "个人双机实时文件夹同步").TextColor(t.TextMuted).FontSize(t.Rem(0.8))
+			ui.Text(c, "SyncT").FontSize(t.Rem(1.15)).Bold()
 		})
 
 		ui.Spacer(c)
@@ -1106,7 +1106,7 @@ func (app *App) buildLogsPage(c *ui.Context, t *ui.Theme) {
 							TextColor(app.logLevelColor(t, entry.Level))
 						ui.Text(c, entry.Message).Grow(1)
 					})
-				}).Grow(1)
+				}).Selectable().Grow(1)
 			} else {
 				if len(tunLogs) == 0 {
 					app.emptyState(c, t, IconCloud, "暂无 Cloudflared 隧道输出，在主机模式下启动隧道后会显示。", "", nil)
@@ -1116,14 +1116,14 @@ func (app *App) buildLogsPage(c *ui.Context, t *ui.Theme) {
 				app.tunnelLogList.Key = func(row int) any { return row }
 				ui.List(c, &app.tunnelLogList, len(tunLogs), func(i int) {
 					ui.Text(c, tunLogs[i]).Padding(t.Space(1), t.Space(3))
-				}).Grow(1)
+				}).Selectable().Grow(1)
 			}
 		})
 	})
 }
 
 func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
-	ui.Scroll(c.Key("settings-scroll")).Fill().Children(func() {
+	ui.Scroll(c.Key("settings-scroll")).Selectable().Fill().Children(func() {
 		ui.Column(c).Padding(t.Space(5)).Gap(t.Space(3)).Children(func() {
 			ui.Row(c).AlignItems(ui.End).Children(func() {
 				ui.Column(c).Gap(t.Space(0.5)).Grow(1).Children(func() {
@@ -1188,21 +1188,24 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 						}
 					}).Description("主机模式监听本地端口并复用系统 Cloudflared；节点模式只发起出站 HTTPS，不监听端口")
 
-					ui.Field(c, "访问密钥", func() {
+					ui.Field(c, "同步密码", func() {
 						ui.Row(c).Gap(t.Space(2)).Children(func() {
-							inp := ui.TextInput(c.Key("input-auth-token"), &app.cfg.AuthToken).Placeholder("两端必须一致的访问密钥").Grow(1)
-							if !app.showToken {
-								inp.Password()
+							inp := ui.TextInput(c.Key("input-auth-token"), &app.passwordInput).
+								Placeholder("两端输入同一个密码").Grow(1)
+							inp.Password()
+							if ui.Button(c.Key("btn-apply-password"), "应用密码").
+								Disabled(strings.TrimSpace(app.passwordInput) == "").Clicked() {
+								app.applyPassword(c)
 							}
-							ui.Toggle(c.Key("toggle-show-token"), &app.showToken, "显示")
 							if ui.Button(c.Key("btn-gen-token"), "随机生成").Clicked() {
 								app.cfg.AuthToken = config.GenerateToken()
+								app.passwordInput = ""
 								app.saveConfig()
 								app.engine.UpdateConfig(app.cfg)
 								c.Toast("已生成新的随机访问密钥")
 							}
 						})
-					}).Description("两端使用相同的 X-SyncT-Token 才能读写同步文件")
+					}).Description("两端输入同一个密码即可配对；密码经 PBKDF2-SHA256 派生为访问密钥，密码本身不会保存或发送。也可以直接粘贴连接码或 st_ 密钥")
 
 					if app.roleIndex == 0 {
 						tmIdx := tunnelModeIndex(app.cfg.TunnelMode)
@@ -1375,6 +1378,8 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 				ui.Textf(c, "数据目录  %s", config.DataDir()).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
 				ui.Textf(c, "配置  %s", config.ConfigPath()).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
 				ui.Textf(c, "索引  %s", config.StatePath()).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
+				ui.Textf(c, "日志  %s (上限 2MB)", filepath.Join(config.PortableRoot(), "SyncT.log")).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
+				ui.Textf(c, "默认同步目录  %s（两台电脑相同）", config.PreferredSyncDir).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
 			})
 		})
 	})
@@ -1626,6 +1631,27 @@ func (app *App) pickSyncDirectory(c *ui.Context) {
 		app.saveConfig()
 		app.engine.UpdateConfig(app.cfg)
 	})
+}
+
+// applyPassword derives the shared key from a user password. Both computers
+// run the same derivation, so typing the same password on each side pairs them
+// without anyone copying a long token.
+func (app *App) applyPassword(c *ui.Context) {
+	password := strings.TrimSpace(app.passwordInput)
+	if password == "" {
+		c.Toast("请先输入同步密码")
+		return
+	}
+	if len(password) < 6 {
+		c.Toast("密码至少 6 位，避免两端误配到同一弱密钥")
+		return
+	}
+	token := config.DeriveTokenFromInput(password)
+	app.cfg.AuthToken = token
+	app.passwordInput = ""
+	app.saveConfig()
+	app.engine.UpdateConfig(app.cfg)
+	c.Toast("已根据密码生成同步密钥，另一端输入同一密码即可连接")
 }
 
 func (app *App) applyShareCodeInput(c *ui.Context) {

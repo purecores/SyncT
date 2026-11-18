@@ -26,6 +26,7 @@ import (
 
 	"github.com/egoist/mygo"
 
+	"synct/internal/applog"
 	"synct/internal/config"
 )
 
@@ -197,9 +198,11 @@ func NewEngine(cfg config.Config, statePath string, onUpdate func()) *Engine {
 		cfg.LocalPort = 0
 	}
 	tr := newSyncHTTPTransport()
-	if tr.ResponseHeaderTimeout == 0 {
-		tr.ResponseHeaderTimeout = 45 * time.Second
-	}
+	// A transfer's response headers arrive only after its body is accepted.
+	// A fixed 45-second header timeout made every slow upload fail with
+	// "http2: timeout awaiting response headers" even though the tunnel was
+	// still moving bytes. Per-request contexts carry the real deadline.
+	tr.ResponseHeaderTimeout = 0
 	e := &Engine{
 		cfg:              cfg,
 		index:            NewIndexStore(statePath),
@@ -1281,6 +1284,12 @@ var maxParallelTransfers = 64
 const (
 	maxParallelLargeTransfers = 4
 	transferSmallFileLimit    = 1 << 20 // 1 MiB
+	// Files above this use the chunked endpoint. A 1 MiB file can still take
+	// over 100 seconds on a very slow uplink, and the tunnel edge answers
+	// that with 524; chunking keeps each request inside both limits.
+	chunkedUploadThreshold = 1 << 20
+	uploadChunkSize        = 4 << 20
+	minUploadChunkSize     = 512 << 10
 )
 
 // runTransferTasks splits work by size and runs both groups at the same time,
@@ -1843,11 +1852,14 @@ func transferCanceled(ctx context.Context, err error) bool {
 	return ctx.Err() != nil || errors.Is(err, context.Canceled)
 }
 
+// transferTimeout gives every transfer a deadline. The 60-minute cap was
+// shorter than several legitimate multi-gigabyte uploads over a home uplink
+// and made them fail with a bare timeout. The estimate now assumes a slow
+// 100 KiB/s link without a hard ceiling beyond 24 hours.
 func transferTimeout(size int64) time.Duration {
 	const minTimeout = 2 * time.Minute
-	const maxTimeout = 60 * time.Minute
-	// Assume a pessimistic 200 KiB/s link so slow tunnels do not spuriously fail.
-	d := time.Duration(float64(size)/(200*1024)) * time.Second
+	const maxTimeout = 24 * time.Hour
+	d := time.Duration(float64(size)/(100*1024)) * time.Second
 	if d < minTimeout {
 		d = minTimeout
 	}
@@ -1855,6 +1867,24 @@ func transferTimeout(size int64) time.Duration {
 		d = maxTimeout
 	}
 	return d
+}
+
+// transferStallTimeout aborts a transfer that stops making progress. A byte
+// counter is watched while the body moves, so a dead connection is noticed in
+// minutes instead of waiting for the whole deadline; a large file on a slow
+// link keeps moving and is never cut off.
+const transferStallTimeout = 3 * time.Minute
+
+// stallOverride lets tests shorten the watchdog without waiting minutes. It
+// holds a time.Duration in nanoseconds; product code reads it through
+// stallTimeout.
+var stallOverride atomic.Int64
+
+func stallTimeout() time.Duration {
+	if v := stallOverride.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return transferStallTimeout
 }
 
 // fetchRemoteFile opens a download and retries a failed request a few times.
@@ -1930,6 +1960,9 @@ func (e *Engine) pullFile(ctx context.Context, cfg config.Config, rem FileMeta, 
 	u := fmt.Sprintf("%s/api/file?path=%s", baseURL, url.QueryEscape(rel))
 	transferCtx, cancel := context.WithTimeout(ctx, transferTimeout(rem.Size))
 	defer cancel()
+	stall := newStallWatch()
+	stopStall := watchStall(stall, stallTimeout(), cancel)
+	defer stopStall()
 	resp, err := e.fetchRemoteFile(transferCtx, ctx, cfg, u)
 	if err != nil {
 		if transferCanceled(ctx, err) {
@@ -1959,7 +1992,7 @@ func (e *Engine) pullFile(ctx context.Context, cfg config.Config, rem FileMeta, 
 
 	hasher := sha256.New()
 	buf := ioBufferPool.Get().(*[]byte)
-	written, copyErr := io.CopyBuffer(io.MultiWriter(&progressWriter{w: tmpFile, onMove: e.countDownloadBytes}, hasher), resp.Body, *buf)
+	written, copyErr := io.CopyBuffer(io.MultiWriter(&progressWriter{w: tmpFile, onMove: e.countDownloadBytes, stall: stall}, hasher), resp.Body, *buf)
 	ioBufferPool.Put(buf)
 	closeErr := tmpFile.Close()
 	if copyErr != nil || closeErr != nil {
@@ -1967,6 +2000,10 @@ func (e *Engine) pullFile(ctx context.Context, cfg config.Config, rem FileMeta, 
 		if copyErr != nil && transferCanceled(ctx, copyErr) {
 			e.index.SetFileStatus(rel, StatusPending, "等待重试")
 			return context.Canceled
+		}
+		if copyErr != nil && stall.stalledFor(time.Now()) >= stallTimeout() {
+			e.index.SetFileStatus(rel, StatusError, "传输停滞")
+			return fmt.Errorf("下载停滞超过 %s，已放弃本次传输 (%s)", stallTimeout(), rel)
 		}
 		e.index.SetFileStatus(rel, StatusError, "下载失败")
 		if copyErr != nil {
@@ -2129,9 +2166,9 @@ func (e *Engine) pushFileToRemote(ctx context.Context, cfg config.Config, loc Fi
 
 	baseURL := config.NormalizeRemoteURL(cfg.RemoteURL)
 	var resp *http.Response
-	if size > maxUploadChunkBytes {
-		// A single request this large is rejected by the tunnel edge (413) or
-		// times out there (524), so send it in parts that also allow a resume.
+	if size > chunkedUploadThreshold {
+		// A single request this large can be rejected by the tunnel edge (413)
+		// or time out there (524), so send it in parts that also allow a resume.
 		resp, err = e.uploadChunked(ctx, cfg, baseURL, f, rel, size, mtime, hash, baseHash)
 	} else {
 		resp, err = e.uploadSingle(ctx, cfg, baseURL, f, rel, size, mtime, hash, baseHash)
@@ -2189,7 +2226,10 @@ func (e *Engine) uploadSingle(ctx context.Context, cfg config.Config, baseURL st
 	)
 	transferCtx, cancel := context.WithTimeout(ctx, transferTimeout(size))
 	defer cancel()
-	body := &progressReader{r: f, onMove: e.countUploadBytes}
+	stall := newStallWatch()
+	stopStall := watchStall(stall, stallTimeout(), cancel)
+	defer stopStall()
+	body := &progressReader{r: f, onMove: e.countUploadBytes, stall: stall}
 	req, err := http.NewRequestWithContext(transferCtx, http.MethodPut, u, body)
 	if err != nil {
 		return nil, err
@@ -2200,6 +2240,9 @@ func (e *Engine) uploadSingle(ctx context.Context, cfg config.Config, baseURL st
 	req.Header.Set("X-SyncT-Node", e.index.NodeID())
 	resp, err := e.transfer.Do(req)
 	if err != nil {
+		if stall.stalledFor(time.Now()) >= stallTimeout() {
+			return nil, fmt.Errorf("上传停滞超过 %s，已放弃本次传输: %w", stallTimeout(), err)
+		}
 		return nil, fmt.Errorf("上传请求失败: %w", err)
 	}
 	return resp, nil
@@ -2213,9 +2256,8 @@ func (e *Engine) uploadChunked(ctx context.Context, cfg config.Config, baseURL s
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, maxUploadChunkBytes)
-	chunkSize := int64(maxUploadChunkBytes)
-	const minChunkSize = int64(1 << 20)
+	buf := make([]byte, uploadChunkSize)
+	chunkSize := int64(uploadChunkSize)
 	var lastChunkErr error
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
@@ -2245,16 +2287,15 @@ func (e *Engine) uploadChunked(ctx context.Context, cfg config.Config, baseURL s
 				// The edge's body cap can be lower than ours (a zone or proxy
 				// setting, or a build using a different limit). Halve the part
 				// and retry the same offset until it fits.
-				if errors.Is(err, errTooLarge) && chunkSize > minChunkSize {
+				if (errors.Is(err, errTooLarge) || errors.Is(err, errGatewayTimeout)) && chunkSize > minUploadChunkSize {
 					chunkSize /= 2
-					if chunkSize < minChunkSize {
-						chunkSize = minChunkSize
+					if chunkSize < minUploadChunkSize {
+						chunkSize = minUploadChunkSize
 					}
 					continue
 				}
 				break
 			}
-			e.countUploadBytes(next.Received - offset)
 			offset = next.Received
 		}
 		session.Received = offset
@@ -2348,9 +2389,13 @@ func (e *Engine) beginChunkedUpload(ctx context.Context, cfg config.Config, base
 func (e *Engine) sendChunk(ctx context.Context, cfg config.Config, baseURL, id string, offset int64, data []byte) (uploadBeginResponse, error) {
 	var out uploadBeginResponse
 	u := fmt.Sprintf("%s/api/upload/chunk?id=%s&offset=%d", baseURL, url.QueryEscape(id), offset)
-	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	reqCtx, cancel := context.WithTimeout(ctx, transferTimeout(int64(len(data))))
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, u, bytes.NewReader(data))
+	stall := newStallWatch()
+	stopStall := watchStall(stall, stallTimeout(), cancel)
+	defer stopStall()
+	body := &progressReader{r: bytes.NewReader(data), onMove: e.countUploadBytes, stall: stall}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, u, body)
 	if err != nil {
 		return out, err
 	}
@@ -2368,6 +2413,9 @@ func (e *Engine) sendChunk(ctx context.Context, cfg config.Config, baseURL, id s
 	}
 	if resp.StatusCode == http.StatusRequestEntityTooLarge {
 		return out, fmt.Errorf("分块被拒绝: %w", errTooLarge)
+	}
+	if resp.StatusCode == 524 {
+		return out, fmt.Errorf("分块被边缘超时: %w", errGatewayTimeout)
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
@@ -2546,6 +2594,7 @@ func (e *Engine) LogLevel(level, msg string) {
 		Level:   level,
 		Message: msg,
 	}
+	applog.Write(level, msg)
 	e.logsMu.Lock()
 	e.logs = append(e.logs, entry)
 	if len(e.logs) > maxLogEntries {

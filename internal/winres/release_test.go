@@ -52,7 +52,7 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 	hostCfg.LocalTLS = true
 	hostCfg.LowPrivilegeMode = true
 	hostCfg.AuthToken = sharedToken
-	hostCfg.SyncDir = "./SyncFolder"
+	hostCfg.SyncDir = config.PreferredSyncDir
 	// The host must be listening whenever the public hostname is opened;
 	// otherwise every first request from the work PC is a 502.
 	hostCfg.AutoStartSync = true
@@ -72,7 +72,7 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 	clientCfg.LocalTLS = true
 	clientCfg.LowPrivilegeMode = true
 	clientCfg.AuthToken = sharedToken
-	clientCfg.SyncDir = "./SyncFolder"
+	clientCfg.SyncDir = config.PreferredSyncDir
 	clientCfgBytes, _ := json.MarshalIndent(clientCfg, "", "  ")
 
 	shareCode := config.EncodeShareCode(config.DefaultPublicURL, sharedToken)
@@ -114,7 +114,7 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 
 **操作方法**：
 1. 将 `+"`SyncT-WorkPC-Client-UserMode-Portable.zip`"+` 解压到工作电脑当前用户有读写权限的任意目录（如 `+"`D:\\Tools\\SyncT`"+` 或个人桌面/文档目录，请勿放在 `+"`C:\\Program Files`"+`）。
-2. 双击 `+"`SyncT.exe`"+`（已预先配好 **节点模式**、域名 `+"`https://synctreei.suosmanthus.cyou`"+` 及与本机一致的 **访问密钥**）。
+2. 双击 `+"`SyncT.exe`"+`（已预先配好 **节点模式**、域名 `+"`https://synctreei.suosmanthus.cyou`"+` 及与本机一致的 **访问密钥**）。默认同步目录为 `+"`D:\\Code\\Syncwork`"+`，两台电脑相同；该路径不可用时回退到程序目录下的 `+"`SyncFolder`"+`。
 3. 点击 **「浏览选择…」** 指定工作电脑上要同步的文件夹，然后点击右上角 **「连接同步」** 即可开始双向实时同步！
 
 ---
@@ -131,6 +131,11 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 - **大文件分块续传**：超过 8MB 的文件分块上传，避开 Cloudflare 的单请求 100MB 上限与约 100 秒的 524 超时；遇到更低的边缘上限会自动缩小分块重试，断线从中断处续传。
 - **日志按批聚合**：一次同步上千个文件只写一行汇总，停止同步不再刷出大量 context canceled 告警，边缘错误页会压缩成一行说明。
 - **冲突与恢复更稳**：下载摘要不符会先重试一次，重试不再生成重复的 .conflict- 副本；从备份恢复的文件按「本端首次看到时间」判断，不会被对端较新的删除记录误删。
+- **大文件不再卡住**：移除了传输的固定 45 秒响应头超时（大文件慢速上传会被误判为超时），改为每个请求自己的期限 + 3 分钟停滞看门狗；1MB 以上的文件都走分块上传，每块 4MB，遇边缘限制自动减半。
+- **文字可选中复制**：整个窗口的文字都可以用鼠标选中、Ctrl+A 全选、Ctrl+C 复制。
+- **日志文件**：程序同级目录的 SyncT.log，上限 2MB，超过后重新开始。
+- **同步密码**：两端输入同一密码即可派生出相同的访问密钥（PBKDF2-SHA256 12 万轮），密码本身不保存。
+- **默认目录**：两端默认 D:\Code\Syncwork。
 `, sharedToken, shareCode)
 
 	// Build 1: SyncT-WorkPC-Client-UserMode-Portable.zip

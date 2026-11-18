@@ -1,7 +1,9 @@
 package config
 
 import (
+	"crypto/pbkdf2"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,6 +73,53 @@ type FolderMapping struct {
 	LocalPath  string `json:"local_path"`            // Local directory path on this computer
 	RemotePath string `json:"remote_path,omitempty"` // Target directory path on the other computer (optional cross-PC path mapping)
 	Enabled    bool   `json:"enabled"`               // Whether this folder mapping is active
+}
+
+// passwordSalt is a fixed application salt for password-derived keys. A fixed
+// salt is deliberate: both computers must derive the same key from the same
+// password without exchanging a salt first, and the derived key never leaves
+// the machine except in TLS to the paired peer.
+const passwordSalt = "SyncT/pairing-2026"
+
+// DerivedTokenPrefix marks an AuthToken produced from a user password. A value
+// without it is treated as a raw token, so existing installs keep working.
+const DerivedTokenPrefix = "pwd1:"
+
+// DeriveToken turns a user password into the shared authentication key. The
+// same password yields the same token on both computers, and the password
+// itself is never stored or transmitted.
+func DeriveToken(password string) string {
+	password = strings.TrimSpace(password)
+	if password == "" {
+		return ""
+	}
+	key, err := pbkdf2.Key(sha256.New, password, []byte(passwordSalt), 120000, 32)
+	if err != nil {
+		// pbkdf2.Key only fails on an invalid hash/parameters, which are fixed
+		// here; fall back to a single SHA-256 so the button still works.
+		sum := sha256.Sum256([]byte(passwordSalt + password))
+		key = sum[:]
+	}
+	return DerivedTokenPrefix + base64.RawURLEncoding.EncodeToString(key)
+}
+
+// IsDerivedToken reports whether a token came from DeriveToken.
+func IsDerivedToken(token string) bool {
+	return strings.HasPrefix(token, DerivedTokenPrefix)
+}
+
+// DeriveTokenFromInput accepts either a raw shared token (st_...) or a
+// password, and returns the token to store. Pasting an existing synct:// code
+// or st_ token keeps working; anything else is treated as a password.
+func DeriveTokenFromInput(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+	if strings.HasPrefix(input, "st_") || IsDerivedToken(input) {
+		return input
+	}
+	return DeriveToken(input)
 }
 
 // NormalizeFolderID sanitizes a folder mapping ID so it is safe for URLs and virtual paths.
@@ -217,12 +267,33 @@ func BinDir() string {
 	return dir
 }
 
-// DefaultSyncDir returns the default portable sync folder (`<PortableRoot>/SyncFolder`).
+// PreferredSyncDir is the shared folder both computers use by default. The
+// dedicated work folder is a single path, so the host and the work PC end up
+// on the same tree without either having to type a path.
+const PreferredSyncDir = `D:\Code\Syncwork`
+
+// DefaultSyncDir returns PreferredSyncDir when it exists or can be created,
+// and otherwise the portable `<PortableRoot>/SyncFolder`. Falling back keeps a
+// machine without that drive working instead of failing at start.
 func DefaultSyncDir() string {
+	if info, err := os.Stat(PreferredSyncDir); err == nil && info.IsDir() {
+		return PreferredSyncDir
+	}
+	if err := os.MkdirAll(PreferredSyncDir, 0o755); err == nil {
+		return PreferredSyncDir
+	}
+	// Do not keep recreating a path the user clearly does not have: remember
+	// that it was unavailable and use the portable folder for this session.
+	preferredUnavailable.Store(true)
 	dir := filepath.Join(PortableRoot(), "SyncFolder")
 	_ = os.MkdirAll(dir, 0o755)
 	return dir
 }
+
+var preferredUnavailable atomic.Bool
+
+// PreferredSyncDirUnavailable reports whether DefaultSyncDir had to fall back.
+func PreferredSyncDirUnavailable() bool { return preferredUnavailable.Load() }
 
 // ConfigPath returns the path to `data/config.json`.
 func ConfigPath() string {

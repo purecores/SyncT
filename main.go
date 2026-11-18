@@ -1,15 +1,20 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"path/filepath"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
+	"synct/internal/applog"
 	"synct/internal/config"
 	appui "synct/internal/ui"
 )
+
+// appVersion is stamped by hand with each release; it is only used in logs.
+const appVersion = "1.3.1"
 
 func main() {
 	mygo.App.SetName("SyncT")
@@ -20,6 +25,10 @@ func main() {
 	mygo.App.SetPath(mygo.PathUserData, dataDir)
 	mygo.App.SetPath(mygo.PathCache, filepath.Join(dataDir, "cache"))
 	mygo.App.SetPath(mygo.PathLogs, filepath.Join(dataDir, "logs"))
+
+	applog.Init(filepath.Join(config.PortableRoot(), "SyncT.log"))
+	defer applog.Close()
+	applog.Write("INFO", fmt.Sprintf("SyncT %s 启动，数据目录 %s", appVersion, dataDir))
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -49,11 +58,13 @@ func main() {
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
 		quitting = true
 		app.StopAll()
+		applog.Write("INFO", "SyncT 退出")
+		applog.Close()
 	})
 
 	mygo.App.WhenReady(func() {
 		mainWin = mygo.NewWindow(mygo.WindowOptions{
-			Title:     "SyncT — 基于 Cloudflared 的 Windows 11 实时文件夹同步工具 (Portable)",
+			Title:     "SyncT",
 			Width:     1060,
 			Height:    720,
 			MinWidth:  820,
@@ -119,7 +130,7 @@ func main() {
 		tray, trayErr := mygo.NewTray(mygo.TrayOptions{
 			ID:      "synct-tray",
 			Icon:    appui.TrayIconPNG(),
-			ToolTip: "SyncT — Cloudflared 实时文件夹同步",
+			ToolTip: "SyncT",
 			Menu:    trayMenu,
 		})
 		if trayErr == nil {

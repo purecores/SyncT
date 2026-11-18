@@ -71,14 +71,20 @@ func TestFormatBytesSpeedAndTransferTimeout(t *testing.T) {
 	if got := transferTimeout(0); got != 2*time.Minute {
 		t.Errorf("transferTimeout(0) = %s; want 2m", got)
 	}
+	// A 100 GiB file over a slow uplink is legitimate and must not be cut off
+	// by a fixed ceiling; the stall watchdog catches dead connections instead.
 	huge := transferTimeout(100 * 1024 * 1024 * 1024)
-	if huge != 60*time.Minute {
-		t.Errorf("transferTimeout(100GiB) = %s; want 60m", huge)
+	if huge != 24*time.Hour {
+		t.Errorf("transferTimeout(100GiB) = %s; want the 24h cap", huge)
 	}
 	small := transferTimeout(10 * 1024 * 1024)
 	large := transferTimeout(100 * 1024 * 1024)
-	if small < 2*time.Minute || small > large || large > 60*time.Minute {
+	if small < 2*time.Minute || small > large || large > 24*time.Hour {
 		t.Errorf("transfer timeouts are not bounded/monotonic: small=%s large=%s", small, large)
+	}
+	// A 300 MB file gets well over ten minutes at the conservative estimate.
+	if got := transferTimeout(300 * 1024 * 1024); got < 10*time.Minute {
+		t.Errorf("transferTimeout(300MiB) = %s; too short for a slow uplink", got)
 	}
 }
 
