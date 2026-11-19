@@ -26,7 +26,7 @@ import (
 )
 
 // SyncTProtocolVersion is reported by /api/status for compatibility checks.
-const SyncTProtocolVersion = "1.3.1"
+const SyncTProtocolVersion = "1.3.2"
 
 // SyncEventType identifies the kind of real-time change broadcast over SSE.
 type SyncEventType string

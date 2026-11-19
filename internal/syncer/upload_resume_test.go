@@ -203,8 +203,13 @@ func TestChunkedUploadRejectsHashMismatch(t *testing.T) {
 
 func TestUploadPathsAreIgnoredByScan(t *testing.T) {
 	matcher := newIgnoreMatcher(config.DefaultIgnorePatterns())
-	if !matcher.Match(".synct-uploads-abc123/part.part", false) {
-		t.Fatal("staging directories must not be indexed")
+	dir := (&Server{}).uploadDirFor(filepath.Join(filepath.VolumeName(os.TempDir())+string(filepath.Separator), "Syncwork", "probe.bin"))
+	base := filepath.Base(dir)
+	if !strings.HasPrefix(base, ".synct") {
+		t.Fatalf("staging dir %q does not start with .synct", base)
+	}
+	if !matcher.Match(base+"/part.part", false) {
+		t.Fatalf("staging dir %q is not covered by the ignore rules", base)
 	}
 	_ = context.Background()
 }

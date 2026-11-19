@@ -85,6 +85,21 @@ Put "https://synctreei.suosmanthus.cyou/api/file?…": http2: timeout awaiting r
   - 中途冻结的隧道会在 20 秒内被放弃且不留下半截文件（`TestFrozenTransferIsAbandoned`）；
   - 响应头被延迟到请求体接收完之后才返回时仍能成功（`TestSlowUploadSurvivesResponseHeaderDelay`，去掉修复会立即失败）。
 
+### 真机公网实测结果（Cloudflare 隧道）
+
+主机端运行 v1.3.2，客户端从同一台机器经 `https://synctreei.suosmanthus.cyou` 上传（真实经过 Cloudflare 边缘与系统 cloudflared）：
+
+| 文件 | 结果 | 校验 |
+| :--- | :--- | :--- |
+| 16 MB | 56.6 秒，0.28 MB/s | 主机端 SHA-256 一致 |
+| **110 MB（超过 100 MB 单请求上限）** | **3 分 4 秒，0.60 MB/s** | 主机端 SHA-256 一致 |
+
+100 MB 以上的文件在旧版本必然 413/524；本次 110 MB 分块上传完整到达主机，日志中只有一行「接收文件: … (110.0 MB)」，没有 `.part` 临时文件被索引或广播。
+
+### 临时文件目录修正
+
+真机日志暴露出分块暂存目录曾被拼成 `..synct-uploads-…`（两个点），而忽略规则匹配的是 `.synct*`，于是扫描器把正在写入的 `.part` 当成普通文件索引并向对端广播。现已改为 `.synct-uploads-…`，并在测试中直接断言该目录名被忽略规则覆盖。
+
 ## 其他本版改动
 
 - **应用名只有一个：SyncT**。窗口标题、顶栏、托盘提示、EXE 文件属性（公司/描述）都只保留 `SyncT`。

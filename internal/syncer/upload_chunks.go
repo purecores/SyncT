@@ -47,7 +47,11 @@ type uploadBeginResponse struct {
 
 func (s *Server) uploadDirFor(fullPath string) string {
 	base := filepath.Base(fullPath)
-	return filepath.Join(filepath.Dir(fullPath), "."+uploadDirName+"-"+hexSafe(base))
+	// uploadDirName already carries the leading dot; the result must start
+	// with ".synct" so the .synct* ignore rule covers it. A doubled dot
+	// ("..synct-uploads-…") did not match, and the scanner indexed a growing
+	// part file and broadcast it to the peer.
+	return filepath.Join(filepath.Dir(fullPath), uploadDirName+"-"+hexSafe(base))
 }
 
 func hexSafe(name string) string {
@@ -372,7 +376,7 @@ func (s *Server) cleanupUploadDirs() {
 			if err != nil {
 				return nil
 			}
-			if d.IsDir() && strings.HasPrefix(d.Name(), "."+uploadDirName+"-") {
+			if d.IsDir() && strings.HasPrefix(d.Name(), uploadDirName+"-") {
 				dirs = append(dirs, path)
 				return filepath.SkipDir
 			}
