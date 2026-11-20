@@ -13,7 +13,7 @@ import (
 
 // AppVersion is the version stamped into the executable's resources. Bump it
 // with the release tag so Windows' file properties match the published build.
-const AppVersion = "1.3.2"
+const AppVersion = "1.4.0"
 
 var windowsIconSizes = []int{16, 24, 32, 48, 64, 128, 256}
 
@@ -239,7 +239,7 @@ func resizeImage(img image.Image, size int) *image.NRGBA {
 func buildAsInvokerManifest() string {
 	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="cyou.suosmanthus.synctreei" version="1.3.2.0" processorArchitecture="*"/>
+  <assemblyIdentity type="win32" name="io.synct.app" version="1.4.0.0" processorArchitecture="*"/>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
@@ -321,7 +321,7 @@ func buildVersionInfo() []byte {
 		{"OriginalFilename", "SyncT.exe"},
 		{"ProductName", "SyncT"},
 		{"ProductVersion", AppVersion},
-		{"MyGoIdentifier", "cyou.suosmanthus.synctreei"},
+		{"MyGoIdentifier", "io.synct.app"},
 	} {
 		text := utf16.Encode([]rune(s[1] + "\x00"))
 		value := make([]byte, 2*len(text))

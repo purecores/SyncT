@@ -18,10 +18,10 @@ import (
 	"time"
 )
 
-// Dedicated self-use endpoints for SyncT.
+// Default local and optional public endpoints for SyncT.
 const (
-	DefaultPublicDomain   = "synctreei.suosmanthus.cyou"
-	DefaultPublicURL      = "https://synctreei.suosmanthus.cyou"
+	DefaultPublicDomain   = ""
+	DefaultPublicURL      = ""
 	DefaultLocalPort      = 18920
 	DefaultLocalListenURL = "https://localhost:18920"
 )
@@ -30,15 +30,15 @@ const (
 type Role string
 
 const (
-	RoleHost   Role = "host"   //の本机服务端: 监听 https://localhost:18920 并通过 Token Tunnel 发布至 synctreei.suosmanthus.cyou
-	RoleClient Role = "client" // 工作电脑客户端 (User受限权限): 零监听端口、零子进程，仅通过 HTTPS 443 连接 synctreei.suosmanthus.cyou
+	RoleHost   Role = "host"   // 本机服务端: 监听 https://localhost:18920 并通过 Cloudflare Tunnel 发布至公网域名
+	RoleClient Role = "client" // 工作电脑客户端 (User受限权限): 零监听端口、零子进程，仅通过 HTTPS 443 连接远端公网域名
 )
 
 // TunnelMode defines how cloudflared is used in Host mode.
 type TunnelMode string
 
 const (
-	TunnelSystem TunnelMode = "system" // Reuse the system's already-running cloudflared service/process (synctreei.suosmanthus.cyou -> https://localhost:18920)
+	TunnelSystem TunnelMode = "system" // Reuse the system's already-running cloudflared service/process (public hostname -> https://localhost:18920)
 	TunnelToken  TunnelMode = "token"  // Spawn a managed cloudflared process with an explicit Tunnel Token
 	TunnelQuick  TunnelMode = "quick"  // TryCloudflare temporary tunnel
 	TunnelDirect TunnelMode = "direct" // Local/LAN server only, without cloudflared
@@ -168,10 +168,11 @@ type Config struct {
 	LowPrivilegeMode bool            `json:"low_privilege_mode"`
 	RemoteURL        string          `json:"remote_url"`
 	AuthToken        string          `json:"auth_token"`
-	SyncDirection    SyncDirection   `json:"sync_direction"`
-	ConflictPolicy   ConflictPolicy  `json:"conflict_policy"`
-	SyncDeletions    bool            `json:"sync_deletions"`
-	AutoStartSync    bool            `json:"auto_start_sync"`
+	SyncDirection       SyncDirection   `json:"sync_direction"`
+	ConflictPolicy      ConflictPolicy  `json:"conflict_policy"`
+	SyncDeletions       bool            `json:"sync_deletions"`
+	AllowPeerRemotePath bool            `json:"allow_peer_remote_path,omitempty"`
+	AutoStartSync       bool            `json:"auto_start_sync"`
 	OpenAtLogin      bool            `json:"open_at_login"`
 	KeepAwake        bool            `json:"keep_awake"`
 	MinimizeToTray   bool            `json:"minimize_to_tray"`
@@ -267,24 +268,31 @@ func BinDir() string {
 	return dir
 }
 
-// PreferredSyncDir is the shared folder both computers use by default. The
-// dedicated work folder is a single path, so the host and the work PC end up
-// on the same tree without either having to type a path.
-const PreferredSyncDir = `D:\Code\Syncwork`
+// PreferredSyncDir is an optional default sync directory override. Left empty
+// by default so installations use `<PortableRoot>/SyncFolder` unless
+// SYNCT_DEFAULT_SYNC_DIR is set.
+const PreferredSyncDir = ""
 
-// DefaultSyncDir returns PreferredSyncDir when it exists or can be created,
-// and otherwise the portable `<PortableRoot>/SyncFolder`. Falling back keeps a
-// machine without that drive working instead of failing at start.
+// DefaultSyncDir returns SYNCT_DEFAULT_SYNC_DIR (or PreferredSyncDir if set)
+// when it exists or can be created, and otherwise the portable
+// `<PortableRoot>/SyncFolder`. Falling back keeps a machine without that drive
+// working instead of failing at start.
 func DefaultSyncDir() string {
-	if info, err := os.Stat(PreferredSyncDir); err == nil && info.IsDir() {
-		return PreferredSyncDir
+	preferred := strings.TrimSpace(os.Getenv("SYNCT_DEFAULT_SYNC_DIR"))
+	if preferred == "" {
+		preferred = PreferredSyncDir
 	}
-	if err := os.MkdirAll(PreferredSyncDir, 0o755); err == nil {
-		return PreferredSyncDir
+	if preferred != "" {
+		if info, err := os.Stat(preferred); err == nil && info.IsDir() {
+			return preferred
+		}
+		if err := os.MkdirAll(preferred, 0o755); err == nil {
+			return preferred
+		}
+		// Do not keep recreating a path the user clearly does not have: remember
+		// that it was unavailable and use the portable folder for this session.
+		preferredUnavailable.Store(true)
 	}
-	// Do not keep recreating a path the user clearly does not have: remember
-	// that it was unavailable and use the portable folder for this session.
-	preferredUnavailable.Store(true)
 	dir := filepath.Join(PortableRoot(), "SyncFolder")
 	_ = os.MkdirAll(dir, 0o755)
 	return dir
@@ -311,19 +319,22 @@ func LocalCertPaths() (certPath, keyPath string) {
 	return filepath.Join(d, "localhost-cert.pem"), filepath.Join(d, "localhost-key.pem")
 }
 
-// Default returns a new Config pre-configured for the user's dedicated setup:
-// System already-running Cloudflared (Token Tunnel) -> synctreei.suosmanthus.cyou -> https://localhost:18920,
-// with User-privilege restraint enabled.
+// Default returns a new Config with portable, low-privilege defaults.
+// SYNCT_PUBLIC_URL may be set to pre-populate CustomPublicURL and RemoteURL.
 func Default() Config {
+	publicURL := NormalizeRemoteURL(os.Getenv("SYNCT_PUBLIC_URL"))
+	if publicURL == "" {
+		publicURL = DefaultPublicURL
+	}
 	return Config{
 		SyncDir:          DefaultSyncDir(),
 		Role:             RoleHost,
 		TunnelMode:       TunnelSystem,
-		CustomPublicURL:  DefaultPublicURL,
+		CustomPublicURL:  publicURL,
 		LocalPort:        DefaultLocalPort,
 		LocalTLS:         true,
 		LowPrivilegeMode: true,
-		RemoteURL:        DefaultPublicURL,
+		RemoteURL:        publicURL,
 		AuthToken:        GenerateToken(),
 		SyncDirection:    SyncBidirectional,
 		ConflictPolicy:   ConflictKeepBoth,
@@ -723,7 +734,7 @@ func EncodeShareCode(remoteURL, token string) string {
 }
 
 // DecodeShareCode parses either a `synct://connect/<base64>`, `synct://?url=...&token=...`,
-// a plain `st_...` token (automatically paired with `https://synctreei.suosmanthus.cyou`),
+// a plain `st_...` token (paired with DefaultPublicURL if configured),
 // or a plain `http(s)://` URL into (remoteURL, token, error).
 func DecodeShareCode(input string) (string, string, error) {
 	input = strings.TrimSpace(input)
@@ -758,14 +769,14 @@ func DecodeShareCode(input string) (string, string, error) {
 		}
 		return NormalizeRemoteURL(remote), tok, nil
 	}
-	// Allow pasting a raw AuthToken (e.g. "st_...") on the work PC to immediately pair with DefaultPublicURL
+	// Allow pasting a raw AuthToken (e.g. "st_...") on the work PC to pair with DefaultPublicURL
 	if strings.HasPrefix(input, "st_") && !strings.ContainsAny(input, " /:\\") {
 		return DefaultPublicURL, input, nil
 	}
 	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
 		return NormalizeRemoteURL(input), "", nil
 	}
-	if strings.Contains(input, ".trycloudflare.com") || strings.Contains(input, DefaultPublicDomain) {
+	if strings.Contains(input, ".trycloudflare.com") || (DefaultPublicDomain != "" && strings.Contains(input, DefaultPublicDomain)) {
 		return NormalizeRemoteURL("https://" + input), "", nil
 	}
 	return "", "", errors.New("无法识别的连接码或隧道 URL 格式")

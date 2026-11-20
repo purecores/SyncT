@@ -6,15 +6,15 @@
 
 ## 专属定制规格（本机服务端 <-> 工作电脑客户端）
 
-1. **直接复用本机已运行的系统 Cloudflared (`synctreei.suosmanthus.cyou` -> `https://localhost:18920`)**
+1. **直接复用本机已运行的系统 Cloudflared (`sync.example.com` -> `https://localhost:18920`)**
    - **复用系统隧道 (`TunnelSystem`)**：通过纯 Go Win32 `CreateToolhelp32Snapshot` 实时检测本机系统已在后台运行的 `cloudflared.exe` 服务/进程（无需提权、无需再次填写 Token、绝不重复启动第二个 `cloudflared` 进程，停止同步时也不会干扰系统正在运行的 `cloudflared` 服务）。
-   - **专属公网域名**：默认内置绑定 `https://synctreei.suosmanthus.cyou`。
+   - **公网域名**：可通过环境变量 `SYNCT_PUBLIC_URL` 或设置页配置公网域名（例如 `https://sync.example.com`）。
    - **本地监听端点**：服务端默认监听 **`https://localhost:18920`**（同时绑定 `127.0.0.1:18920` 与 `[::1]:18920` 回环接口）。
-   - **双协议自适应 + 自签名 TLS 证书**：内建自动生成 `localhost` / `synctreei.suosmanthus.cyou` 的 ECDSA P-256 自签名 TLS 证书（保存在 `./data/localhost-cert.pem`），通过首字节嗅探在同一端口 `18920` 同时兼容 `https://localhost:18920` 与 `http://localhost:18920`。
+   - **双协议自适应 + 自签名 TLS 证书**：内建自动生成 `localhost` / `sync.example.com` 的 ECDSA P-256 自签名 TLS 证书（保存在 `./data/localhost-cert.pem`），通过首字节嗅探在同一端口 `18920` 同时兼容 `https://localhost:18920` 与 `http://localhost:18920`。
 
 2. **工作电脑 User 权限克制设计 (`asInvoker`)**
    - **内嵌 `asInvoker` Windows 权限清单 (`RT_MANIFEST`)**：PE 资源段中显式声明 `<requestedExecutionLevel level="asInvoker" uiAccess="false"/>`，在仅具普通 `User` 权限的工作电脑上运行**绝不弹出 UAC 管理员提权窗口**。
-   - **工作电脑端零监听端口 & 零子进程**：工作电脑处于客户端模式（`RoleClient`），仅通过标准出站 HTTPS (`443`) 访问 `https://synctreei.suosmanthus.cyou`，不监听任何本地端口（绝不触发 Windows 防火墙管理员弹窗），也不需要启动或附带 `cloudflared.exe`。
+   - **工作电脑端零监听端口 & 零子进程**：工作电脑处于客户端模式（`RoleClient`），仅通过标准出站 HTTPS (`443`) 访问 `https://sync.example.com`，不监听任何本地端口（绝不触发 Windows 防火墙管理员弹窗），也不需要启动或附带 `cloudflared.exe`。
    - **100% 便携目录隔离**：所有配置文件 (`config.json`)、状态索引 (`state.json`)、窗口尺寸状态 (`window-state.json`)、缓存与日志均通过 `mygo.App.SetPath` 强制重定向至程序同级的 `./data/` 目录，**零注册表写入、零 `%AppData%` 写入、零系统目录访问**。
 
 3. **多文件夹同步与跨机目录映射 (`LocalPath` ↔ `RemotePath`)**
@@ -22,8 +22,8 @@
    - **跨电脑异构目录映射**：支持指定本机某个文件夹同步到另一台电脑的不同目标文件夹路径（对端连接握手时自动识别映射 ID 并创建/绑定对应的目标文件夹）。
    - **左下角实时吞吐面板**：侧边栏左下角与底部状态栏常驻展示实时上传/下载速率 (`↑` / `↓`)、文件与文件夹数量、总容量以及尚未同步的文件数。
 
-4. **专属应用图标 (`bailian-color.png`)**
-   - 已将 `D:\Code\Nikki\light\bailian-color.png` 转换为多尺寸高清图标（`16px ~ 256px`）编译进 `rsrc_windows_amd64.syso`（EXE 文件图标、任务栏图标、窗口图标），同时内嵌至软件顶栏与 Windows 11 系统托盘图标。
+4. **专属应用图标 (`internal/ui/app_icon.png`)**
+   - 已将 `internal/ui/app_icon.png` 转换为多尺寸高清图标（`16px ~ 256px`）编译进 `rsrc_windows_amd64.syso`（EXE 文件图标、任务栏图标、窗口图标），同时内嵌至软件顶栏与 Windows 11 系统托盘图标。
 
 ---
 
@@ -31,9 +31,13 @@
 
 | 发布包文件 | 适用电脑 | 内容说明 |
 | :--- | :--- | :--- |
-| `release/SyncT-Windows11-Portable-Release.zip` | **完整双机合集包** | 同时包含 `SyncT-Host-Server/`（本机服务端）、`SyncT-WorkPC-Client/`（工作电脑端）及双机配对说明 |
-| `release/SyncT-Host-Server-Portable.zip` | **本机（服务端）** | 含 `SyncT.exe` 及预设为 `Host + 复用系统已运行的 Cloudflared + https://synctreei.suosmanthus.cyou + https://localhost:18920` 的配置（无需打包额外的 `cloudflared.exe`） |
-| `release/SyncT-WorkPC-Client-UserMode-Portable.zip` | **工作电脑（User 权限客户端）** | 含 `SyncT.exe` 与已预先配对相同 `auth_token` 及 `https://synctreei.suosmanthus.cyou` 的客户端配置 |
+| `release/SyncT-Windows11-Portable-Release-v1.4.0.zip` | **完整双机合集包** | 同时包含 `SyncT-Host-Server/`（本机服务端）、`SyncT-WorkPC-Client/`（工作电脑端）及双机配对说明 |
+| `release/SyncT-Host-Server-Portable-v1.4.0.zip` | **本机（服务端）** | 含 `SyncT.exe` 及预设为 `Host + 复用系统已运行的 Cloudflared + https://localhost:18920` 的配置（无需打包额外的 `cloudflared.exe`） |
+| `release/SyncT-WorkPC-Client-UserMode-Portable-v1.4.0.zip` | **工作电脑（User 权限客户端）** | 含 `SyncT.exe` 及同样中性默认值的客户端配置 |
+
+发布包文件名带版本号（取自 `internal/winres.AppVersion`），重新打包时会自动清理 `release/` 下旧版本的同名归档。
+
+> 发布包中的公网域名取自构建时的 `SYNCT_PUBLIC_URL`（未设置时使用示例域名 `https://sync.example.com`），同步目录取自 `SYNCT_DEFAULT_SYNC_DIR`，两端需配置相同的 `auth_token` 才能配对。
 
 ---
 
@@ -73,7 +77,7 @@
 
 ```text
 [WARN] 上传文件 Chat/C2/output/…/…CCD DryEnd.pdf 失败: 上传请求失败:
-Put "https://synctreei.suosmanthus.cyou/api/file?…": http2: timeout awaiting response headers
+Put "https://sync.example.com/api/file?…": http2: timeout awaiting response headers
 ```
 
 - **根因**：传输用的 `http.Transport` 设了固定 45 秒的 `ResponseHeaderTimeout`，而后端的响应头要等**整个请求体**被 Cloudflare 与主机端接收后才返回。工作电脑上行慢时，大文件还在传，客户端就已经按 45 秒判超时；界面同时表现为「卡住、无速度」。
@@ -87,7 +91,7 @@ Put "https://synctreei.suosmanthus.cyou/api/file?…": http2: timeout awaiting r
 
 ### 真机公网实测结果（Cloudflare 隧道）
 
-主机端运行 v1.3.2，客户端从同一台机器经 `https://synctreei.suosmanthus.cyou` 上传（真实经过 Cloudflare 边缘与系统 cloudflared）：
+主机端运行 v1.3.2，客户端从同一台机器经 `https://sync.example.com` 上传（真实经过 Cloudflare 边缘与系统 cloudflared）：
 
 | 文件 | 结果 | 校验 |
 | :--- | :--- | :--- |
@@ -106,7 +110,7 @@ Put "https://synctreei.suosmanthus.cyou/api/file?…": http2: timeout awaiting r
 - **所有文字可选中复制**：整个窗口是可选中的容器，日志、路径、速率、错误信息都能用鼠标拖选、双击选词、Ctrl+A 全选、Ctrl+C 复制，右键菜单含「复制/全选」。
 - **日志文件**：`SyncT.log` 写在程序同级目录（便携），内容与界面日志一致；到达 2MB 即重新开始并写入一行标记，不会无限增长；设置页会显示日志位置。
 - **自定义密码 → 密钥**：设置页新增「同步密码」，输入同一个密码点击「应用密码」，两端用 PBKDF2-SHA256（12 万轮，固定应用盐）派生出相同的访问密钥；密码本身不保存、不传输。直接粘贴 `st_…` 密钥或 `synct://` 连接码仍然有效。
-- **默认同步目录**：两端默认都是 `D:\Code\Syncwork`；该路径不存在且无法创建时自动回退到程序目录下的 `SyncFolder`。
+- **默认同步目录**：两端默认使用 `<SyncT>/SyncFolder`（可通过环境变量 `SYNCT_DEFAULT_SYNC_DIR` 指定统一路径，不可用时自动回退到程序目录下的 `SyncFolder`）。
 
 ## v1.3.0 根据工作电脑真实日志的修复
 
@@ -118,6 +122,32 @@ Put "https://synctreei.suosmanthus.cyou/api/file?…": http2: timeout awaiting r
 4. **错误信息里塞进整页 HTML**：413/524 的响应体是 Cloudflare 错误页（含 beacon 脚本），会整段写进日志和界面。现在剥离标签与脚本，只留一行摘要，并把 413/524 翻译成可操作的说明。
 5. **同一文件反复产生冲突副本**：日志里有 3 个连续「哈希校验失败」，随后出现多个同名 `.conflict-` 文件。现在下载遇到摘要不符会**先重试一次**；只有本地内容确实是尚未同步的新改动时才备份冲突副本，重试不再重复生成。
 6. **备份恢复的文件被静默删除**：日志显示移除的 zip 在下一次推送时又出现并再次失败。文件从备份/压缩包恢复时会保留旧的修改时间，旧的判断只看 mtime，对端较新的删除记录会把它当作过期内容删掉。现在索引记录 `SeenAt`（本端首次看到该内容的时间），参与发明判定；同时 `state.json` 持久化「待上传」标记，重启后仍知道哪些本地内容对端没有。
+
+## v1.4.0 安全加固与同步正确性修复
+
+本版针对审计发现的高危问题做了系统性修复，默认行为有可见变化：
+
+### 安全
+
+- **本地 TLS 证书改为名称约束 CA + 非 CA 叶子证书**：CA 证书带 `MaxPathLen=0`、`NameConstraints`（仅 `localhost`、`127.0.0.1/32`、`::1/128`），**CA 私钥只在签名时存在于内存，绝不落盘**；磁盘上只保留叶子证书私钥。旧版「CA-as-leaf 万能证书」在启动时会被自动识别并重新生成。
+- **修复「信任本地证书」的提权命令注入**：不再通过 `cmd.exe /c` 拼接 `certutil` 与 `net stop/start`，改为经 `ShellExecuteW`（`runas`）直接调用 `certutil.exe`，参数中的路径做绝对路径 + 危险字符白名单校验，且安装前再次校验证书确为受约束的 localhost CA、磁盘私钥不与 CA 匹配。
+- **禁止对端劫持本地目录映射**：`/api/manifest` 携带的 `folders[].remote_path` 默认不再能指向同步根目录之外，也绝不覆写已存在的本地目录映射。确需跨根目录映射时必须在本机显式开启 `AllowPeerRemotePath`；相对路径、`..` 段、盘符根目录一律拒绝。
+- **鉴权收紧**：服务端 `AuthToken` 为空时直接拒绝所有请求（不再裸奔放行）；只接受 `X-SyncT-Token` 请求头，`?token=` 查询参数已移除；增加按客户端 IP 的失败速率限制（默认 10 次/分钟，超限返回 `429` 并带 `Retry-After`），经 Cloudflare 隧道时按 `CF-Connecting-IP` 区分真实客户端。
+- **符号链接逃逸防护**：解析同步目标路径时同时做词法包含校验与 `EvalSymlinks` 实际路径校验，同步目录内植入的符号链接无法把读写重定向到目录外。
+- **服务端强制同步方向**：`SyncPushOnly` 的主机拒绝 `PUT`/`POST`/`DELETE /api/file`、`/api/dirs` 与全部分块上传端点（`403`），也拒绝接收对端目录与目录删除事件；`SyncPullOnly` 的主机拒绝文件下载。
+
+### 同步正确性
+
+- **三方基线冲突检测**：索引持久化每个文件「上次与对端确认一致」的哈希 `synced_hashes`，对账与推送都以它而非对端当前哈希作为 `base_hash`。两台电脑离线各改同一文件时，服务端能真正识别分叉并保留 `.conflict-` 副本，不再被时钟差静默覆盖。
+- **空文件夹墓碑**：目录也参与删除同步（清单新增 `dir_tombstones`，SSE 新增 `dir_delete` 事件）。删除空文件夹会传播到对端，不再「删了又活」；同步删除时只删空目录，绝不 `RemoveAll` 对端新增了文件的目录；目录重新创建后可正常复活。
+- **大文件断点续传下载**：`GET /api/file` 支持 `Range`（`206`/`416`，`Accept-Ranges: bytes`），客户端对 ≥1 MB 文件按 4 MB 分段写入固定的 `.synct.part` 文件，中断后从已落盘偏移继续；下载前后校验 `X-SyncT-SHA256` 与 `X-SyncT-Size`，远端文件中途变更会自动放弃重来。
+- **分块上传原子化**：分块写入不再使用 `O_APPEND` 直接追加到 `.part`，改为按服务端记录偏移 `Truncate+Seek` 写入，任何写错/超长/断流都会回滚到上一偏移；`commit` 用 `committing` 标记原子占位，重复 commit 返回 `409`，并用整文件 SHA-256 校验后才原子替换正式文件。
+- **`WriteTimeout` 拆解**：服务端不再设置一刀切的 10 分钟写超时，改为在 `http.ResponseController` 上按处理器设定写期限（SSE 每帧 30 秒、普通接口 2 分钟、下载按字节进度每秒续期），大文件下载与长连 SSE 不再被服务端硬杀。
+
+### 工程与隐私
+
+- 默认公网域名/本地磁盘路径等个人化配置全部移除，改为 `SYNCT_PUBLIC_URL`、`SYNCT_DEFAULT_SYNC_DIR` 环境变量或设置页填写。
+- `TestPackagePortableReleaseZIPs` 只在 `SYNCT_BUILD_RELEASE=1` 时执行，不再删除仓库 `bin/`，也不再覆写仓库内 `./data/config.json`；`build-portable.bat` 已同步设置该变量。
 
 ## 实测吞吐（v1.2.1）
 

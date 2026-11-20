@@ -18,42 +18,58 @@ var (
 
 const swShowNormal = 1
 
-// installCACert adds the local origin certificate to the machine-wide
-// "Trusted Root Certification Authorities" store and restarts the cloudflared
-// service so its cached root pool picks the certificate up.
+// buildCertUtilArgs validates pemPath and returns the exact argument string for
+// invoking certutil.exe directly (without cmd.exe).
+func buildCertUtilArgs(pemPath string) (string, error) {
+	cleanPath, err := validateCertUtilPath(pemPath)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(`-addstore -f Root "%s"`, cleanPath), nil
+}
+
+// installCACert adds the name-constrained localhost Root CA certificate to the
+// machine-wide "Trusted Root Certification Authorities" store by invoking
+// certutil.exe directly via ShellExecuteW with the "runas" verb (never cmd.exe).
 //
 // The store write affects every user on this PC and therefore needs
 // administrator rights: ShellExecuteW with the "runas" verb asks Windows to
 // show its UAC consent prompt. A declined prompt simply does nothing, which
 // is why the caller must verify the tunnel recovers rather than assume it.
 func installCACert(pemPath string) error {
+	args, err := buildCertUtilArgs(pemPath)
+	if err != nil {
+		return fmt.Errorf("证书路径安全校验失败: %w", err)
+	}
+
 	data, err := os.ReadFile(pemPath)
 	if err != nil {
 		return fmt.Errorf("读取证书文件失败: %w", err)
 	}
-	block, _ := pem.Decode(data)
+	block, rest := pem.Decode(data)
 	if block == nil || block.Type != "CERTIFICATE" {
 		return fmt.Errorf("证书文件格式无效: %s", pemPath)
 	}
-	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+	if extra, _ := pem.Decode(rest); extra != nil {
+		return fmt.Errorf("证书文件只能包含单个 CA 证书: %s", pemPath)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
 		return fmt.Errorf("证书内容无效: %w", err)
+	}
+	if err := validateConstrainedLocalCA(cert); err != nil {
+		return fmt.Errorf("拒绝安装不受约束的 CA 证书: %w", err)
 	}
 
 	verb, err := syscall.UTF16PtrFromString("runas")
 	if err != nil {
 		return err
 	}
-	file, err := syscall.UTF16PtrFromString("cmd.exe")
+	file, err := syscall.UTF16PtrFromString("certutil.exe")
 	if err != nil {
 		return err
 	}
-	// The certificate is self-signed for localhost and only used by the local
-	// cloudflared origin connection; restarting the service makes cloudflared
-	// re-read the Windows root store.
-	params, err := syscall.UTF16PtrFromString(fmt.Sprintf(
-		`/c certutil -addstore -f Root "%s" & net stop cloudflared & net start cloudflared & timeout /t 6 >nul`,
-		pemPath,
-	))
+	params, err := syscall.UTF16PtrFromString(args)
 	if err != nil {
 		return err
 	}

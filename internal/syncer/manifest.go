@@ -77,22 +77,24 @@ type Tombstone struct {
 
 // Manifest is the complete snapshot of all synced folders at a point in time.
 type Manifest struct {
-	NodeID      string                 `json:"node_id"`
-	GeneratedAt int64                  `json:"generated_at"`
-	Folders     []config.FolderMapping `json:"folders,omitempty"`
-	Dirs        map[string]DirMeta     `json:"dirs,omitempty"`
-	Files       map[string]FileMeta    `json:"files"`
-	Tombstones  map[string]Tombstone   `json:"tombstones"`
+	NodeID        string                 `json:"node_id"`
+	GeneratedAt   int64                  `json:"generated_at"`
+	Folders       []config.FolderMapping `json:"folders,omitempty"`
+	Dirs          map[string]DirMeta     `json:"dirs,omitempty"`
+	DirTombstones map[string]Tombstone   `json:"dir_tombstones,omitempty"`
+	Files         map[string]FileMeta    `json:"files"`
+	Tombstones    map[string]Tombstone   `json:"tombstones"`
 }
 
 // NewManifest creates an empty initialized Manifest.
 func NewManifest(nodeID string) Manifest {
 	return Manifest{
-		NodeID:      nodeID,
-		GeneratedAt: time.Now().UTC().UnixMilli(),
-		Dirs:        make(map[string]DirMeta),
-		Files:       make(map[string]FileMeta),
-		Tombstones:  make(map[string]Tombstone),
+		NodeID:        nodeID,
+		GeneratedAt:   time.Now().UTC().UnixMilli(),
+		Dirs:          make(map[string]DirMeta),
+		DirTombstones: make(map[string]Tombstone),
+		Files:         make(map[string]FileMeta),
+		Tombstones:    make(map[string]Tombstone),
 	}
 }
 
@@ -105,6 +107,9 @@ func (m Manifest) Clone() Manifest {
 	}
 	for k, v := range m.Dirs {
 		out.Dirs[k] = v
+	}
+	for k, v := range m.DirTombstones {
+		out.DirTombstones[k] = v
 	}
 	for k, v := range m.Files {
 		out.Files[k] = v
@@ -171,6 +176,29 @@ func ResolveFolderFullPath(cfg config.Config, virtualRel string) (config.FolderM
 	fullPath := filepath.Join(folder.LocalPath, filepath.FromSlash(innerCleaned))
 	if !isPathWithinRoot(folder.LocalPath, fullPath) {
 		return config.FolderMapping{}, "", "", false
+	}
+	// Reject symlinks at fullPath itself or in any existing ancestor inside the
+	// sync root so a symlink planted inside a synced folder cannot redirect reads
+	// or writes outside folder.LocalPath.
+	if linfo, err := os.Lstat(fullPath); err == nil && linfo.Mode()&fs.ModeSymlink != 0 {
+		return config.FolderMapping{}, "", "", false
+	}
+	if resolvedRoot, err := filepath.EvalSymlinks(folder.LocalPath); err == nil {
+		cur := fullPath
+		for {
+			if _, statErr := os.Lstat(cur); statErr == nil {
+				resolvedCur, evalErr := filepath.EvalSymlinks(cur)
+				if evalErr != nil || !isPathWithinRoot(resolvedRoot, resolvedCur) {
+					return config.FolderMapping{}, "", "", false
+				}
+				break
+			}
+			parent := filepath.Dir(cur)
+			if parent == cur || !isPathWithinRoot(folder.LocalPath, parent) {
+				break
+			}
+			cur = parent
+		}
 	}
 	return folder, innerCleaned, fullPath, true
 }
@@ -270,14 +298,17 @@ type IndexStore struct {
 	nodeID       string
 	statePath    string
 	folders      []config.FolderMapping
-	files        map[string]FileMeta
-	dirs         map[string]DirMeta
-	tombstones   map[string]Tombstone
-	statuses     map[string]FileStatus
-	statusCounts map[FileStatus]int
-	directions   map[string]string
-	dirty        map[string]struct{} // local content the peer may not have yet
-	addedDirs    []DirMeta
+	files         map[string]FileMeta
+	dirs          map[string]DirMeta
+	dirTombstones map[string]Tombstone
+	tombstones    map[string]Tombstone
+	statuses      map[string]FileStatus
+	statusCounts  map[FileStatus]int
+	directions    map[string]string
+	dirty         map[string]struct{} // local content the peer may not have yet
+	syncedHashes  map[string]string   // last SHA-256 confirmed in sync with the peer
+	addedDirs     []DirMeta
+	deletedDirs   []Tombstone
 	// newFilesPending marks newly scanned files 待同步 until a transfer
 	// confirms them. The host serves its files directly, so only a client
 	// that is allowed to push treats new local files as pending.
@@ -317,13 +348,15 @@ type folderStat struct {
 }
 
 type persistedState struct {
-	NodeID      string               `json:"node_id"`
-	Files       map[string]FileMeta  `json:"files"`
-	Dirs        map[string]DirMeta   `json:"dirs,omitempty"`
-	Dirty       map[string]bool      `json:"dirty,omitempty"`
-	Tombstones  map[string]Tombstone `json:"tombstones"`
-	FolderRoots map[string]string    `json:"folder_roots,omitempty"`
-	SavedAt     int64                `json:"saved_at,omitempty"`
+	NodeID        string               `json:"node_id"`
+	Files         map[string]FileMeta  `json:"files"`
+	Dirs          map[string]DirMeta   `json:"dirs,omitempty"`
+	DirTombstones map[string]Tombstone `json:"dir_tombstones,omitempty"`
+	Dirty         map[string]bool      `json:"dirty,omitempty"`
+	SyncedHashes  map[string]string    `json:"synced_hashes,omitempty"`
+	Tombstones    map[string]Tombstone `json:"tombstones"`
+	FolderRoots   map[string]string    `json:"folder_roots,omitempty"`
+	SavedAt       int64                `json:"saved_at,omitempty"`
 }
 
 // NewIndexStore creates or loads a persistent IndexStore.
@@ -333,11 +366,13 @@ func NewIndexStore(statePath string) *IndexStore {
 		statePath:     statePath,
 		files:         make(map[string]FileMeta),
 		dirs:          make(map[string]DirMeta),
+		dirTombstones: make(map[string]Tombstone),
 		tombstones:    make(map[string]Tombstone),
 		statuses:      make(map[string]FileStatus),
 		statusCounts:  make(map[FileStatus]int),
 		directions:    make(map[string]string),
 		dirty:         make(map[string]struct{}),
+		syncedHashes:  make(map[string]string),
 		folderStats:   make(map[string]folderStat),
 		folderRoots:   make(map[string]string),
 		pendingWrites: make(map[string]struct{}),
@@ -391,9 +426,17 @@ func (s *IndexStore) load() {
 	if ps.Dirs != nil && len(ps.Dirs) > 0 {
 		s.dirs = ps.Dirs
 	}
+	if ps.DirTombstones != nil && len(ps.DirTombstones) > 0 {
+		s.dirTombstones = ps.DirTombstones
+	}
 	for rel, dirty := range ps.Dirty {
 		if dirty {
 			s.dirty[rel] = struct{}{}
+		}
+	}
+	for rel, h := range ps.SyncedHashes {
+		if h != "" {
+			s.syncedHashes[rel] = h
 		}
 	}
 	if ps.Tombstones != nil && len(ps.Tombstones) > 0 {
@@ -415,6 +458,9 @@ func (s *IndexStore) load() {
 		// scanner discovers or sees change afterwards start as pending.
 		s.statuses[rel] = StatusSynced
 		s.statusCounts[StatusSynced]++
+		if _, isDirty := s.dirty[rel]; !isDirty && s.syncedHashes[rel] == "" && meta.SHA256 != "" {
+			s.syncedHashes[rel] = meta.SHA256
+		}
 	}
 	s.mu.Lock()
 	s.pruneTombstonesLocked(time.Now().UTC().UnixMilli())
@@ -473,13 +519,15 @@ func (s *IndexStore) saveNow() error {
 		return nil
 	}
 	ps := persistedState{
-		NodeID:      s.nodeID,
-		Files:       make(map[string]FileMeta, len(s.files)),
-		Dirs:        make(map[string]DirMeta, len(s.dirs)),
-		Dirty:       make(map[string]bool, len(s.dirty)),
-		Tombstones:  make(map[string]Tombstone, len(s.tombstones)),
-		FolderRoots: make(map[string]string, len(s.folderRoots)),
-		SavedAt:     time.Now().UTC().UnixMilli(),
+		NodeID:        s.nodeID,
+		Files:         make(map[string]FileMeta, len(s.files)),
+		Dirs:          make(map[string]DirMeta, len(s.dirs)),
+		DirTombstones: make(map[string]Tombstone, len(s.dirTombstones)),
+		Dirty:         make(map[string]bool, len(s.dirty)),
+		SyncedHashes:  make(map[string]string, len(s.syncedHashes)),
+		Tombstones:    make(map[string]Tombstone, len(s.tombstones)),
+		FolderRoots:   make(map[string]string, len(s.folderRoots)),
+		SavedAt:       time.Now().UTC().UnixMilli(),
 	}
 	for k, v := range s.files {
 		ps.Files[k] = v
@@ -487,8 +535,16 @@ func (s *IndexStore) saveNow() error {
 	for k, v := range s.dirs {
 		ps.Dirs[k] = v
 	}
+	for k, v := range s.dirTombstones {
+		ps.DirTombstones[k] = v
+	}
 	for k := range s.dirty {
 		ps.Dirty[k] = true
+	}
+	for k, v := range s.syncedHashes {
+		if v != "" {
+			ps.SyncedHashes[k] = v
+		}
 	}
 	for k, v := range s.tombstones {
 		ps.Tombstones[k] = v
@@ -758,9 +814,13 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 	var skipped int
 	var scanErrs []string
 
-	unreadableDirs, walkErr := walkFolderTree(rootDir, matcher, func(innerDir string) {
+	unreadableDirs, walkErr := walkFolderTree(rootDir, matcher, func(innerDir string, d fs.DirEntry) {
 		virtualRel := JoinFolderRelPath(folder.ID, innerDir)
-		seenDirs[virtualRel] = DirMeta{FolderID: folder.ID, RelPath: virtualRel}
+		var modTime int64
+		if info, infoErr := d.Info(); infoErr == nil {
+			modTime = info.ModTime().UTC().UnixMilli()
+		}
+		seenDirs[virtualRel] = DirMeta{FolderID: folder.ID, RelPath: virtualRel, ModTime: modTime}
 	}, func(fullPath, innerRel string, d fs.DirEntry) {
 		info, infoErr := d.Info()
 		if infoErr != nil || !info.Mode().IsRegular() {
@@ -867,6 +927,21 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 				}
 			}
 		}
+		for rel, dirMeta := range s.dirs {
+			fid, inner := SplitFolderRelPath(rel)
+			if fid != folder.ID {
+				continue
+			}
+			if _, ok := seenDirs[rel]; ok {
+				continue
+			}
+			for _, prefix := range unreadableDirs {
+				if inner == prefix || strings.HasPrefix(inner, prefix+"/") {
+					seenDirs[rel] = dirMeta
+					break
+				}
+			}
+		}
 		s.mu.RUnlock()
 	}
 
@@ -886,6 +961,20 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 		}
 		if _, pending := s.pendingWrites[rel]; pending {
 			seen[rel] = prev
+		}
+	}
+	// Also keep ancestor directories of in-flight writes so a directory being
+	// populated is never tombstoned mid-transfer.
+	for pendingRel := range s.pendingWrites {
+		fid, inner := SplitFolderRelPath(pendingRel)
+		if fid != folder.ID {
+			continue
+		}
+		for dir := path.Dir(inner); dir != "." && dir != "/" && dir != ""; dir = path.Dir(dir) {
+			vrel := JoinFolderRelPath(folder.ID, dir)
+			if prevDir, ok := s.dirs[vrel]; ok {
+				seenDirs[vrel] = prevDir
+			}
 		}
 	}
 
@@ -909,6 +998,7 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 		s.deleteStatusLocked(rel)
 		delete(s.directions, rel)
 		delete(s.dirty, rel)
+		delete(s.syncedHashes, rel)
 		if matcher.Match(inner, false) {
 			// Newly ignored files are dropped without a deletion event.
 			continue
@@ -963,13 +1053,47 @@ func (s *IndexStore) scanFolderLocked(folder config.FolderMapping, matcher *igno
 		}
 	}
 
-	// Directories are only ever created on this side from an explicit scan of
-	// a folder that exists, or from a peer's manifest. Dropping them here would
-	// forget empty folders without telling the peer anything, so they persist.
+	// Remove directories that disappeared from this folder and create directory
+	// tombstones so empty-folder deletions propagate to the peer instead of
+	// coming back as zombie directories on the next reconciliation.
+	for rel, prevDir := range s.dirs {
+		fid, inner := SplitFolderRelPath(rel)
+		if fid != folder.ID {
+			continue
+		}
+		if _, ok := seenDirs[rel]; ok {
+			continue
+		}
+		delete(s.dirs, rel)
+		if matcher.Match(inner, true) {
+			continue
+		}
+		tomb := Tombstone{
+			FolderID:  fid,
+			RelPath:   rel,
+			DeletedAt: max64(now, prevDir.ModTime+1),
+		}
+		s.dirTombstones[rel] = tomb
+		s.deletedDirs = append(s.deletedDirs, tomb)
+	}
+
+	// Track newly discovered directories and clear stale tombstones when a
+	// folder is recreated after a previous deletion.
 	for rel, dir := range seenDirs {
-		if _, ok := s.dirs[rel]; !ok {
+		prevDir, existed := s.dirs[rel]
+		if !existed {
+			dir.ModTime = max64(dir.ModTime, now)
 			s.dirs[rel] = dir
+			delete(s.dirTombstones, rel)
 			s.addedDirs = append(s.addedDirs, dir)
+		} else {
+			if dir.ModTime < prevDir.ModTime {
+				dir.ModTime = prevDir.ModTime
+			}
+			s.dirs[rel] = dir
+			if tomb, hasTomb := s.dirTombstones[rel]; hasTomb && dir.ModTime >= tomb.DeletedAt {
+				delete(s.dirTombstones, rel)
+			}
 		}
 	}
 
@@ -1045,7 +1169,7 @@ func parallelScanHashes(n int, fn func(int)) {
 // empty tree, which must never be mistaken for a mass deletion. Nested
 // symlinks/junctions are not followed. Unreadable subdirectories are returned
 // so callers can preserve their cached entries; an unreadable root is fatal.
-func walkFolderTree(root string, matcher *ignoreMatcher, onDir func(innerRel string), onFile func(fullPath, innerRel string, d fs.DirEntry)) ([]string, error) {
+func walkFolderTree(root string, matcher *ignoreMatcher, onDir func(innerRel string, d fs.DirEntry), onFile func(fullPath, innerRel string, d fs.DirEntry)) ([]string, error) {
 	var unreadable []string
 	var walk func(dir, rel string) error
 	walk = func(dir, rel string) error {
@@ -1072,7 +1196,7 @@ func walkFolderTree(root string, matcher *ignoreMatcher, onDir func(innerRel str
 					continue
 				}
 				if onDir != nil {
-					onDir(innerRel)
+					onDir(innerRel, entry)
 				}
 				if err := walk(fullPath, innerRel); err != nil {
 					return err
@@ -1103,6 +1227,9 @@ func (s *IndexStore) Snapshot() Manifest {
 	for k, v := range s.dirs {
 		m.Dirs[k] = v
 	}
+	for k, v := range s.dirTombstones {
+		m.DirTombstones[k] = v
+	}
 	for k, v := range s.files {
 		m.Files[k] = v
 	}
@@ -1128,6 +1255,9 @@ func (s *IndexStore) MarkFileSynced(meta FileMeta, status FileStatus, direction 
 	s.setStatusLocked(meta.RelPath, status)
 	if status == StatusSynced || status == StatusConflict {
 		delete(s.dirty, meta.RelPath)
+		if meta.SHA256 != "" {
+			s.syncedHashes[meta.RelPath] = meta.SHA256
+		}
 	}
 	if direction != "" {
 		s.directions[meta.RelPath] = direction
@@ -1155,11 +1285,14 @@ func (s *IndexStore) InvalidateHash(relPath string) {
 // SetFileStatus updates the status and direction shown in the UI table.
 func (s *IndexStore) SetFileStatus(relPath string, status FileStatus, direction string) {
 	s.mu.Lock()
-	if _, ok := s.files[relPath]; ok {
+	if meta, ok := s.files[relPath]; ok {
 		changed := s.statuses[relPath] != status || (direction != "" && s.directions[relPath] != direction)
 		s.setStatusLocked(relPath, status)
 		if status == StatusSynced {
 			delete(s.dirty, relPath)
+			if meta.SHA256 != "" {
+				s.syncedHashes[relPath] = meta.SHA256
+			}
 		}
 		if direction != "" {
 			s.directions[relPath] = direction
@@ -1171,6 +1304,15 @@ func (s *IndexStore) SetFileStatus(relPath string, status FileStatus, direction 
 	s.mu.Unlock()
 }
 
+// SyncedHash returns the last SHA-256 confirmed in sync with the peer for relPath.
+func (s *IndexStore) SyncedHash(relPath string) string {
+	relPath = filepath.ToSlash(strings.TrimSpace(relPath))
+	s.mu.RLock()
+	h := s.syncedHashes[relPath]
+	s.mu.RUnlock()
+	return h
+}
+
 // MarkFileDeleted records a deletion tombstone in the index.
 func (s *IndexStore) MarkFileDeleted(relPath string, deletedAt int64) Tombstone {
 	fid, _ := SplitFolderRelPath(relPath)
@@ -1180,6 +1322,7 @@ func (s *IndexStore) MarkFileDeleted(relPath string, deletedAt int64) Tombstone 
 	s.deleteStatusLocked(relPath)
 	delete(s.directions, relPath)
 	delete(s.dirty, relPath)
+	delete(s.syncedHashes, relPath)
 	delete(s.pendingWrites, relPath)
 	if existed {
 		st := s.folderStats[fid]
@@ -1304,7 +1447,12 @@ var ioBufferPool = sync.Pool{New: func() any {
 
 // CleanRelPath validates and normalizes a relative path, rejecting path traversal (`..`).
 func CleanRelPath(rel string) (string, bool) {
-	rel = filepath.ToSlash(strings.TrimSpace(rel))
+	rel = strings.TrimSpace(rel)
+	if strings.ContainsRune(rel, '\x00') {
+		return "", false
+	}
+	rel = strings.ReplaceAll(rel, "\\", "/")
+	rel = filepath.ToSlash(rel)
 	rel = strings.TrimPrefix(rel, "/")
 	if rel == "" || rel == "." {
 		return "", false
@@ -1397,6 +1545,15 @@ func (s *IndexStore) TakeAddedDirs() []DirMeta {
 	return out
 }
 
+// TakeDeletedDirs returns directory tombstones created since the last call.
+func (s *IndexStore) TakeDeletedDirs() []Tombstone {
+	s.mu.Lock()
+	out := s.deletedDirs
+	s.deletedDirs = nil
+	s.mu.Unlock()
+	return out
+}
+
 // DirsList returns a copy of the indexed directories for a manifest request.
 func (s *IndexStore) DirsList() []DirMeta {
 	s.mu.RLock()
@@ -1406,6 +1563,35 @@ func (s *IndexStore) DirsList() []DirMeta {
 	}
 	s.mu.RUnlock()
 	return out
+}
+
+// DirTombstonesList returns a copy of the indexed directory tombstones.
+func (s *IndexStore) DirTombstonesList() []Tombstone {
+	s.mu.RLock()
+	out := make([]Tombstone, 0, len(s.dirTombstones))
+	for _, t := range s.dirTombstones {
+		out = append(out, t)
+	}
+	s.mu.RUnlock()
+	return out
+}
+
+// DirMeta returns one indexed directory record, if present.
+func (s *IndexStore) DirMeta(relPath string) (DirMeta, bool) {
+	relPath = filepath.ToSlash(strings.TrimSpace(relPath))
+	s.mu.RLock()
+	d, ok := s.dirs[relPath]
+	s.mu.RUnlock()
+	return d, ok
+}
+
+// DirTombstone returns the directory deletion record for a path, if one exists.
+func (s *IndexStore) DirTombstone(relPath string) (Tombstone, bool) {
+	relPath = filepath.ToSlash(strings.TrimSpace(relPath))
+	s.mu.RLock()
+	t, ok := s.dirTombstones[relPath]
+	s.mu.RUnlock()
+	return t, ok
 }
 
 // SetNewFilesPending controls whether files discovered by a later scan start
@@ -1421,12 +1607,48 @@ func (s *IndexStore) AddDir(dir DirMeta) {
 	if dir.RelPath == "" {
 		return
 	}
+	if dir.FolderID == "" {
+		dir.FolderID, _ = SplitFolderRelPath(dir.RelPath)
+	}
+	if dir.ModTime <= 0 {
+		dir.ModTime = time.Now().UTC().UnixMilli()
+	}
 	s.mu.Lock()
-	if _, ok := s.dirs[dir.RelPath]; !ok {
+	prev, existed := s.dirs[dir.RelPath]
+	if !existed || dir.ModTime > prev.ModTime {
 		s.dirs[dir.RelPath] = dir
+		delete(s.dirTombstones, dir.RelPath)
 		s.generation++
 	}
 	s.mu.Unlock()
+}
+
+// MarkDirDeleted removes a directory from the index and records a directory tombstone.
+// It returns the recorded tombstone and whether the directory was previously indexed.
+func (s *IndexStore) MarkDirDeleted(relPath string, deletedAt int64) (Tombstone, bool) {
+	relPath = filepath.ToSlash(strings.TrimSpace(relPath))
+	fid, _ := SplitFolderRelPath(relPath)
+	s.mu.Lock()
+	prevDir, existed := s.dirs[relPath]
+	delete(s.dirs, relPath)
+	if deletedAt <= 0 {
+		deletedAt = time.Now().UTC().UnixMilli()
+	}
+	if prevDir.ModTime >= deletedAt {
+		deletedAt = prevDir.ModTime + 1
+	}
+	if existingTomb, hasTomb := s.dirTombstones[relPath]; hasTomb && existingTomb.DeletedAt >= deletedAt {
+		deletedAt = existingTomb.DeletedAt
+	}
+	tomb := Tombstone{
+		FolderID:  fid,
+		RelPath:   relPath,
+		DeletedAt: deletedAt,
+	}
+	s.dirTombstones[relPath] = tomb
+	s.generation++
+	s.mu.Unlock()
+	return tomb, existed
 }
 
 // DirCount reports how many directories the index knows, for the UI's
@@ -1511,11 +1733,18 @@ func (s *IndexStore) removeInactiveFoldersLocked(active map[string]struct{}) {
 		s.deleteStatusLocked(rel)
 		delete(s.directions, rel)
 		delete(s.dirty, rel)
+		delete(s.syncedHashes, rel)
 		st := s.folderStats[fid]
 		st.files--
 		st.bytes -= prev.Size
 		s.setFolderStatLocked(fid, st)
 		delete(s.pendingWrites, rel)
+	}
+	for rel := range s.syncedHashes {
+		fid, _ := SplitFolderRelPath(rel)
+		if _, ok := active[fid]; !ok {
+			delete(s.syncedHashes, rel)
+		}
 	}
 	for rel, tomb := range s.tombstones {
 		fid := tomb.FolderID
@@ -1532,6 +1761,15 @@ func (s *IndexStore) removeInactiveFoldersLocked(active map[string]struct{}) {
 			delete(s.dirs, rel)
 		}
 	}
+	for rel, tomb := range s.dirTombstones {
+		fid := tomb.FolderID
+		if fid == "" {
+			fid, _ = SplitFolderRelPath(rel)
+		}
+		if _, ok := active[fid]; !ok {
+			delete(s.dirTombstones, rel)
+		}
+	}
 	for fid := range s.folderRoots {
 		if _, ok := active[fid]; !ok {
 			delete(s.folderRoots, fid)
@@ -1540,26 +1778,31 @@ func (s *IndexStore) removeInactiveFoldersLocked(active map[string]struct{}) {
 }
 
 func (s *IndexStore) pruneTombstonesLocked(now int64) {
+	pruneTombstoneMap(s.tombstones, now)
+	pruneTombstoneMap(s.dirTombstones, now)
+}
+
+func pruneTombstoneMap(m map[string]Tombstone, now int64) {
 	cutoff := now - int64(tombstoneRetention/time.Millisecond)
-	for rel, tomb := range s.tombstones {
+	for rel, tomb := range m {
 		if tomb.DeletedAt < cutoff {
-			delete(s.tombstones, rel)
+			delete(m, rel)
 		}
 	}
-	if len(s.tombstones) <= tombstoneLimit {
+	if len(m) <= tombstoneLimit {
 		return
 	}
 	type agedTomb struct {
 		rel string
 		at  int64
 	}
-	aged := make([]agedTomb, 0, len(s.tombstones))
-	for rel, tomb := range s.tombstones {
+	aged := make([]agedTomb, 0, len(m))
+	for rel, tomb := range m {
 		aged = append(aged, agedTomb{rel: rel, at: tomb.DeletedAt})
 	}
 	sort.Slice(aged, func(i, j int) bool { return aged[i].at < aged[j].at })
 	for i := 0; i < len(aged)-tombstoneLimit; i++ {
-		delete(s.tombstones, aged[i].rel)
+		delete(m, aged[i].rel)
 	}
 }
 

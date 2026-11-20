@@ -14,7 +14,7 @@ import (
 )
 
 // appVersion is stamped by hand with each release; it is only used in logs.
-const appVersion = "1.3.2"
+const appVersion = "1.4.0"
 
 func main() {
 	mygo.App.SetName("SyncT")

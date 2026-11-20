@@ -325,17 +325,59 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
+// validatePeerRemotePath checks whether a RemotePath proposed by a peer is safe
+// to materialize on this machine. By default only paths strictly inside syncDir
+// are accepted; paths outside syncDir require explicit local opt-in via
+// AllowPeerRemotePath and still reject relative paths, traversal segments, and
+// filesystem roots.
+func validatePeerRemotePath(syncDir, candidate string, allowExternal bool) (string, bool) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" || strings.ContainsRune(candidate, '\x00') {
+		return "", false
+	}
+	for _, seg := range strings.Split(strings.ReplaceAll(candidate, "\\", "/"), "/") {
+		if seg == ".." {
+			return "", false
+		}
+	}
+	cleaned := filepath.Clean(candidate)
+	if !filepath.IsAbs(cleaned) {
+		return "", false
+	}
+	// Reject filesystem roots such as "/" or "C:\".
+	if filepath.Dir(cleaned) == cleaned {
+		return "", false
+	}
+	if syncDir != "" {
+		cleanSyncDir := filepath.Clean(syncDir)
+		if isPathWithinRoot(cleanSyncDir, cleaned) {
+			return cleaned, true
+		}
+	}
+	if allowExternal {
+		return cleaned, true
+	}
+	return "", false
+}
+
 // ApplyPeerFolderMappings merges folder mappings announced by the remote peer.
-// When the peer specifies a RemotePath (target folder on this computer) or adds a new folder ID,
-// this node automatically creates/updates the corresponding local folder mapping.
+// Existing local folder paths are never overwritten by a peer. Unknown folder IDs
+// are mapped under this machine's SyncDir unless the peer's RemotePath is inside
+// SyncDir or the user explicitly enabled AllowPeerRemotePath.
 func (e *Engine) ApplyPeerFolderMappings(peerFolders []config.FolderMapping) bool {
 	if len(peerFolders) == 0 {
 		return false
 	}
 	e.mu.Lock()
 	cfg := e.cfg.Clone()
+	if cfg.SyncDirection == config.SyncPushOnly {
+		// A push-only node accepts nothing from the peer, including folder mappings.
+		e.mu.Unlock()
+		return false
+	}
 	changed := false
 	var dirsToCreate []string
+	var rejectedWarnings []string
 
 	for _, pf := range peerFolders {
 		if !pf.Enabled {
@@ -355,25 +397,32 @@ func (e *Engine) ApplyPeerFolderMappings(peerFolders []config.FolderMapping) boo
 
 		if foundIdx >= 0 {
 			existing := &cfg.SyncFolders[foundIdx]
-			if peerTargetForUs != "" && existing.LocalPath != peerTargetForUs {
-				existing.LocalPath = peerTargetForUs
-				if foundIdx == 0 {
-					cfg.SyncDir = peerTargetForUs
-				}
-				dirsToCreate = append(dirsToCreate, peerTargetForUs)
-				changed = true
+			if peerTargetForUs != "" && !strings.EqualFold(filepath.Clean(existing.LocalPath), filepath.Clean(peerTargetForUs)) {
+				rejectedWarnings = append(rejectedWarnings, fmt.Sprintf("已忽略远端对现有目录 %s 的路径覆盖请求 (%s)", id, peerTargetForUs))
 			}
 			if pf.Label != "" && existing.Label == "" {
 				existing.Label = pf.Label
 				changed = true
 			}
 		} else {
-			localDir := peerTargetForUs
+			var localDir string
+			if peerTargetForUs != "" {
+				if safeDir, ok := validatePeerRemotePath(cfg.SyncDir, peerTargetForUs, cfg.AllowPeerRemotePath); ok {
+					localDir = safeDir
+				} else {
+					rejectedWarnings = append(rejectedWarnings, fmt.Sprintf("已拒绝远端指定的同步根目录外路径 (%s -> %s)，已回退至主同步目录内", id, peerTargetForUs))
+				}
+			}
 			if localDir == "" {
 				if id == config.DefaultFolderID {
 					localDir = cfg.SyncDir
 				} else {
-					localDir = filepath.Join(cfg.SyncDir, id)
+					candidate := filepath.Join(cfg.SyncDir, id)
+					if !isPathWithinRoot(cfg.SyncDir, candidate) {
+						rejectedWarnings = append(rejectedWarnings, fmt.Sprintf("已拒绝非法远端目录 ID (%s)", pf.ID))
+						continue
+					}
+					localDir = candidate
 				}
 			}
 			label := strings.TrimSpace(pf.Label)
@@ -397,12 +446,19 @@ func (e *Engine) ApplyPeerFolderMappings(peerFolders []config.FolderMapping) boo
 
 	if !changed {
 		e.mu.Unlock()
+		for _, w := range rejectedWarnings {
+			e.LogThrottled("peer-map-reject:"+w, "WARN", w, 5*time.Minute)
+		}
 		return false
 	}
 
 	cfg.Normalize()
 	e.cfg = cfg
 	e.mu.Unlock()
+
+	for _, w := range rejectedWarnings {
+		e.LogThrottled("peer-map-reject:"+w, "WARN", w, 5*time.Minute)
+	}
 
 	// Only create directories for mappings this call added or changed. An
 	// unrelated vanished folder must not be re-created just because the peer
@@ -931,16 +987,17 @@ func (e *Engine) runLocalScan(ctx context.Context, pending map[string]struct{}, 
 	}
 
 	addedDirs := e.index.TakeAddedDirs()
-	if len(changed) == 0 && len(deleted) == 0 && len(addedDirs) == 0 {
+	deletedDirs := e.index.TakeDeletedDirs()
+	if len(changed) == 0 && len(deleted) == 0 && len(addedDirs) == 0 && len(deletedDirs) == 0 {
 		if elapsed := time.Since(started); elapsed > 2*time.Second {
 			e.Logf("目录扫描完成，无变更 (耗时 %s，来源: %s)", elapsed.Round(time.Millisecond), reason)
 		}
 		return
 	}
 
-	totalEvents := len(changed) + len(deleted) + len(addedDirs)
+	totalEvents := len(changed) + len(deleted) + len(addedDirs) + len(deletedDirs)
 	if totalEvents > 20 {
-		e.LogLevel("SYNC", fmt.Sprintf("目录扫描完成: %d 项新增/更新，%d 项删除，%d 个新文件夹 (来源: %s)", len(changed), len(deleted), len(addedDirs), reason))
+		e.LogLevel("SYNC", fmt.Sprintf("目录扫描完成: %d 项新增/更新，%d 项删除，%d 个新文件夹，%d 个删除文件夹 (来源: %s)", len(changed), len(deleted), len(addedDirs), len(deletedDirs), reason))
 	} else {
 		for i := range changed {
 			f := changed[i]
@@ -980,10 +1037,22 @@ func (e *Engine) runLocalScan(ctx context.Context, pending map[string]struct{}, 
 					Tombstone:  &t,
 				})
 			}
+			for i := range deletedDirs {
+				dt := deletedDirs[i]
+				if totalEvents <= 20 {
+					e.LogLevel("SYNC", fmt.Sprintf("检测到本地文件夹删除: %s", dt.RelPath))
+				}
+				e.server.Broadcast(SyncEvent{
+					Type:       EventDirDelete,
+					OriginNode: e.index.NodeID(),
+					Tombstone:  &dt,
+				})
+			}
 		}
 	} else {
 		// Client mode: push local changes if direction allows. Serialize with
 		// reconciliation so two goroutines never write the same peer file at once.
+		needDirDeleteSync := false
 		if ctx.Err() == nil {
 			e.reconcileMu.Lock()
 			if cfg.SyncDirection != config.SyncPullOnly {
@@ -993,7 +1062,8 @@ func (e *Engine) runLocalScan(ctx context.Context, pending map[string]struct{}, 
 					}
 				}
 				runTransferTasks(ctx, changed, func(f FileMeta) int64 { return f.Size }, func(f FileMeta) {
-					if err := e.pushFileToRemote(ctx, cfg, f, ""); err != nil && !transferCanceled(ctx, err) {
+					baseHash := e.index.SyncedHash(f.RelPath)
+					if err := e.pushFileToRemote(ctx, cfg, f, baseHash); err != nil && !transferCanceled(ctx, err) {
 						e.LogThrottled("push:"+f.RelPath+":"+err.Error(), "WARN", fmt.Sprintf("上传 %s 失败: %v", f.RelPath, err), 30*time.Second)
 					}
 				})
@@ -1006,9 +1076,15 @@ func (e *Engine) runLocalScan(ctx context.Context, pending map[string]struct{}, 
 							e.LogThrottled("del:"+t.RelPath+":"+err.Error(), "WARN", fmt.Sprintf("同步删除 %s 失败: %v", t.RelPath, err), 30*time.Second)
 						}
 					}
+					if len(deletedDirs) > 0 {
+						needDirDeleteSync = true
+					}
 				}
 			}
 			e.reconcileMu.Unlock()
+		}
+		if needDirDeleteSync {
+			e.requestReconcile()
 		}
 	}
 
@@ -1223,11 +1299,11 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 		case cfg.SyncDirection == config.SyncPullOnly:
 			pulls = append(pulls, pullTask{rel: rel, rem: remFile, conflict: cfg.ConflictPolicy == config.ConflictKeepBoth})
 		case cfg.SyncDirection == config.SyncPushOnly:
-			pushes = append(pushes, pushTask{rel: rel, loc: locFile, baseHash: remFile.SHA256})
+			pushes = append(pushes, pushTask{rel: rel, loc: locFile, baseHash: e.index.SyncedHash(rel)})
 		case remFile.ModTime >= locFile.ModTime:
 			pulls = append(pulls, pullTask{rel: rel, rem: remFile, conflict: cfg.ConflictPolicy == config.ConflictKeepBoth})
 		default:
-			pushes = append(pushes, pushTask{rel: rel, loc: locFile, baseHash: remFile.SHA256})
+			pushes = append(pushes, pushTask{rel: rel, loc: locFile, baseHash: e.index.SyncedHash(rel)})
 		}
 	}
 
@@ -1252,7 +1328,7 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 			continue
 		}
 		if canPush {
-			pushes = append(pushes, pushTask{rel: rel, loc: locFile})
+			pushes = append(pushes, pushTask{rel: rel, loc: locFile, baseHash: e.index.SyncedHash(rel)})
 		}
 	}
 
@@ -1266,6 +1342,14 @@ func (e *Engine) ReconcileWithRemote(ctx context.Context) error {
 			e.LogThrottled("push:"+t.rel+":"+err.Error(), "WARN", fmt.Sprintf("上传文件 %s 失败: %v", t.rel, err), 30*time.Second)
 		}
 	})
+
+	if canPull && cfg.SyncDeletions && len(remoteManifest.DirTombstones) > 0 {
+		dirTombs := make([]Tombstone, 0, len(remoteManifest.DirTombstones))
+		for _, dt := range remoteManifest.DirTombstones {
+			dirTombs = append(dirTombs, dt)
+		}
+		e.applyPeerDirTombstones(cfg, dirTombs, remoteManifest.NodeID)
+	}
 
 	e.index.RequestSave()
 	e.notifyUI()
@@ -1394,6 +1478,96 @@ func (e *Engine) ApplyPeerDirs(dirs []DirMeta, _ string) int {
 	return created
 }
 
+// ApplyPeerDirTombstones removes empty directories deleted on the peer and
+// records directory tombstones so they do not reappear on future reconciliations.
+func (e *Engine) ApplyPeerDirTombstones(tombstones []Tombstone, origin string) int {
+	if len(tombstones) == 0 {
+		return 0
+	}
+	cfg := e.Config()
+	if cfg.SyncDirection == config.SyncPushOnly || !cfg.SyncDeletions {
+		return 0
+	}
+	removed := e.applyPeerDirTombstones(cfg, tombstones, origin)
+	if removed > 0 {
+		e.index.RequestSave()
+		e.notifyUI()
+	}
+	return removed
+}
+
+func (e *Engine) applyPeerDirTombstones(cfg config.Config, tombstones []Tombstone, origin string) int {
+	if len(tombstones) == 0 || cfg.SyncDirection == config.SyncPushOnly || !cfg.SyncDeletions {
+		return 0
+	}
+	sorted := append([]Tombstone(nil), tombstones...)
+	// Remove deepest nested directories first so parents become empty before os.Remove.
+	sort.Slice(sorted, func(i, j int) bool {
+		di := strings.Count(sorted[i].RelPath, "/")
+		dj := strings.Count(sorted[j].RelPath, "/")
+		if di != dj {
+			return di > dj
+		}
+		return sorted[i].RelPath > sorted[j].RelPath
+	})
+
+	matcher := newIgnoreMatcher(cfg.IgnorePatterns)
+	removed := 0
+	for _, tomb := range sorted {
+		cleanRel, ok := CleanRelPath(tomb.RelPath)
+		if !ok {
+			continue
+		}
+		if matcher.MatchVirtual(cleanRel, true) {
+			continue
+		}
+		_, inner, fullPath, ok := ResolveFolderFullPath(cfg, cleanRel)
+		if !ok || inner == "" {
+			continue
+		}
+		if d, hasDir := e.index.DirMeta(cleanRel); hasDir &&
+			cfg.SyncDirection != config.SyncPullOnly && d.ModTime > tomb.DeletedAt {
+			// Locally recreated after the peer's deletion; keep the directory.
+			continue
+		}
+		info, statErr := os.Stat(fullPath)
+		if statErr == nil {
+			if !info.IsDir() {
+				continue
+			}
+			if err := os.Remove(fullPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				// Non-empty directory or locked: never force-delete files inside.
+				continue
+			}
+			rec, _ := e.index.MarkDirDeleted(cleanRel, tomb.DeletedAt)
+			removed++
+			if cfg.Role == config.RoleHost && e.server != nil {
+				e.server.Broadcast(SyncEvent{
+					Type:       EventDirDelete,
+					OriginNode: origin,
+					Tombstone:  &rec,
+				})
+			}
+		} else if errors.Is(statErr, os.ErrNotExist) {
+			rec, existed := e.index.MarkDirDeleted(cleanRel, tomb.DeletedAt)
+			if existed {
+				removed++
+				if cfg.Role == config.RoleHost && e.server != nil {
+					e.server.Broadcast(SyncEvent{
+						Type:       EventDirDelete,
+						OriginNode: origin,
+						Tombstone:  &rec,
+					})
+				}
+			}
+		}
+	}
+	if removed > 0 {
+		e.markSyncedActivity(fmt.Sprintf("已同步删除空文件夹: %d 个", removed))
+	}
+	return removed
+}
+
 // pushDirsToRemote tells the peer about folders created here. The host also
 // sees them through the periodic manifest exchange, but this arrives while the
 // user is still looking at the folder they just made.
@@ -1439,12 +1613,18 @@ func (e *Engine) pushDirsToRemote(ctx context.Context, cfg config.Config, dirs [
 func (e *Engine) ensureRemoteDirs(cfg config.Config, dirs map[string]DirMeta) {
 	created := 0
 	matcher := newIgnoreMatcher(cfg.IgnorePatterns)
-	for rel := range dirs {
+	for rel, dirMeta := range dirs {
 		cleanRel, ok := CleanRelPath(rel)
 		if !ok {
 			continue
 		}
 		if matcher.MatchVirtual(cleanRel, true) {
+			continue
+		}
+		if tomb, hasTomb := e.index.DirTombstone(cleanRel); hasTomb &&
+			cfg.SyncDirection != config.SyncPullOnly && tomb.DeletedAt >= dirMeta.ModTime {
+			// A local directory deletion newer than the peer's directory must not
+			// be resurrected as a zombie folder.
 			continue
 		}
 		folder, inner, fullPath, ok := ResolveFolderFullPath(cfg, cleanRel)
@@ -1453,6 +1633,7 @@ func (e *Engine) ensureRemoteDirs(cfg config.Config, dirs map[string]DirMeta) {
 		}
 		if info, statErr := os.Stat(fullPath); statErr == nil {
 			if info.IsDir() {
+				e.index.AddDir(DirMeta{FolderID: folder.ID, RelPath: cleanRel, ModTime: dirMeta.ModTime})
 				continue
 			}
 			// A file occupies the path; writing through it would fail anyway.
@@ -1463,7 +1644,7 @@ func (e *Engine) ensureRemoteDirs(cfg config.Config, dirs map[string]DirMeta) {
 			e.LogThrottled("dir-mkdir:"+rel+":"+err.Error(), "WARN", fmt.Sprintf("创建远端空文件夹失败 (%s): %v", rel, err), 30*time.Second)
 			continue
 		}
-		e.index.AddDir(DirMeta{FolderID: folder.ID, RelPath: cleanRel})
+		e.index.AddDir(DirMeta{FolderID: folder.ID, RelPath: cleanRel, ModTime: dirMeta.ModTime})
 		created++
 	}
 	if created > 0 {
@@ -1546,14 +1727,6 @@ func (e *Engine) listenRemoteEvents(ctx context.Context) error {
 		return fmt.Errorf("SSE 连接空闲超时 (%s)", sseIdleTimeout)
 	}
 	return errors.New("SSE 连接已断开")
-}
-
-// isPullOrBidirectional reports whether this node accepts an originating
-// node's directories. A push-only node never writes to its folders.
-func (e *Engine) isPullOrBidirectional() bool {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.cfg.SyncDirection != config.SyncPushOnly
 }
 
 // isPushOnly reads the direction without cloning the whole config (called per SSE line).
@@ -1668,6 +1841,7 @@ func (e *Engine) processRemoteEventsLocked(ctx context.Context, pending map[stri
 	matcher := newIgnoreMatcher(cfg.IgnorePatterns)
 	needReconcile := false
 	applied := 0
+	var dirDeletes []Tombstone
 	for _, rel := range rels {
 		if ctx.Err() != nil {
 			return false
@@ -1711,6 +1885,11 @@ func (e *Engine) processRemoteEventsLocked(ctx context.Context, pending map[stri
 			if ev.Dir == nil || ev.Dir.RelPath == "" || matcher.MatchVirtual(ev.Dir.RelPath, true) {
 				continue
 			}
+			if tomb, hasTomb := e.index.DirTombstone(ev.Dir.RelPath); hasTomb &&
+				cfg.SyncDirection != config.SyncPullOnly && tomb.DeletedAt >= ev.Dir.ModTime {
+				needReconcile = true
+				continue
+			}
 			e.ensureRemoteDirs(cfg, map[string]DirMeta{ev.Dir.RelPath: *ev.Dir})
 			applied++
 		case EventDelete:
@@ -1733,7 +1912,19 @@ func (e *Engine) processRemoteEventsLocked(ctx context.Context, pending map[stri
 				continue
 			}
 			applied++
+		case EventDirDelete:
+			if ev.Tombstone == nil || !cfg.SyncDeletions || matcher.MatchVirtual(ev.Tombstone.RelPath, true) {
+				continue
+			}
+			if _, _, _, ok := ResolveFolderFullPath(cfg, ev.Tombstone.RelPath); !ok {
+				needReconcile = true
+				continue
+			}
+			dirDeletes = append(dirDeletes, *ev.Tombstone)
 		}
+	}
+	if len(dirDeletes) > 0 {
+		applied += e.applyPeerDirTombstones(cfg, dirDeletes, "")
 	}
 	if applied > 0 {
 		e.index.RequestSave()
@@ -1791,15 +1982,26 @@ func remoteStatusError(action string, status int, body string) error {
 }
 
 func (e *Engine) fetchRemoteManifest(ctx context.Context, baseURL, token string, localFolders []config.FolderMapping) (Manifest, error) {
-	pushDirs := e.isPullOrBidirectional()
+	cfg := e.Config()
+	pushDirs := cfg.SyncDirection != config.SyncPullOnly
+	var dirs []DirMeta
+	var dirTombstones []Tombstone
+	if pushDirs {
+		dirs = e.index.DirsList()
+		if cfg.SyncDeletions {
+			dirTombstones = e.index.DirTombstonesList()
+		}
+	}
 	payload, err := json.Marshal(struct {
-		Folders  []config.FolderMapping `json:"folders"`
-		Dirs     []DirMeta              `json:"dirs,omitempty"`
-		PushDirs bool                   `json:"push_dirs,omitempty"`
+		Folders       []config.FolderMapping `json:"folders"`
+		Dirs          []DirMeta              `json:"dirs,omitempty"`
+		DirTombstones []Tombstone            `json:"dir_tombstones,omitempty"`
+		PushDirs      bool                   `json:"push_dirs,omitempty"`
 	}{
-		Folders:  localFolders,
-		Dirs:     e.index.DirsList(),
-		PushDirs: pushDirs,
+		Folders:       localFolders,
+		Dirs:          dirs,
+		DirTombstones: dirTombstones,
+		PushDirs:      pushDirs,
 	})
 	if err != nil {
 		return Manifest{}, fmt.Errorf("编码目录映射失败: %w", err)
@@ -1837,6 +2039,9 @@ func (e *Engine) fetchRemoteManifest(ctx context.Context, baseURL, token string,
 	}
 	if m.Dirs == nil {
 		m.Dirs = make(map[string]DirMeta)
+	}
+	if m.DirTombstones == nil {
+		m.DirTombstones = make(map[string]Tombstone)
 	}
 	if m.Tombstones == nil {
 		m.Tombstones = make(map[string]Tombstone)
@@ -1892,7 +2097,25 @@ func stallTimeout() time.Duration {
 // one transient bad response turned into a visible error, and the mirror image
 // (a truncated 200 response) would silently fail the digest check after the
 // whole body arrived. A retry costs one request and removes both.
+var (
+	// Files at or above this threshold download in HTTP Range chunks into a
+	// deterministic .synct.part file so an interrupted transfer resumes instead
+	// of starting over from byte 0. Vars allow tests to exercise chunking with
+	// small fixtures.
+	resumableDownloadThreshold int64 = 1 << 20 // 1 MiB
+	downloadChunkSize          int64 = 4 << 20 // 4 MiB per Range request
+)
+
+func partFilePath(parentDir, rel, sha string) string {
+	sum := sha256.Sum256([]byte(rel + "\x00" + strings.ToLower(sha)))
+	return filepath.Join(parentDir, ".synct.part."+hex.EncodeToString(sum[:8]))
+}
+
 func (e *Engine) fetchRemoteFile(transferCtx, ctx context.Context, cfg config.Config, u string) (*http.Response, error) {
+	return e.fetchRemoteRange(transferCtx, ctx, cfg, u, -1, -1)
+}
+
+func (e *Engine) fetchRemoteRange(transferCtx, ctx context.Context, cfg config.Config, u string, start, end int64) (*http.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if ctx.Err() != nil {
@@ -1904,6 +2127,9 @@ func (e *Engine) fetchRemoteFile(transferCtx, ctx context.Context, cfg config.Co
 		}
 		req.Header.Set("X-SyncT-Token", cfg.AuthToken)
 		req.Header.Set("X-SyncT-Node", e.index.NodeID())
+		if start >= 0 && end >= start {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+		}
 		resp, err := e.transfer.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("请求远端文件失败: %w", err)
@@ -1913,7 +2139,7 @@ func (e *Engine) fetchRemoteFile(transferCtx, ctx context.Context, cfg config.Co
 			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
 			continue
 		}
-		if resp.StatusCode == http.StatusOK {
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent || resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
 			return resp, nil
 		}
 		lastErr = remoteStatusError("下载文件", resp.StatusCode, "")
@@ -1939,6 +2165,274 @@ func (e *Engine) pullFileFromRemoteRetry(ctx context.Context, cfg config.Config,
 	return e.pullFile(ctx, cfg, rem, saveConflict, true)
 }
 
+func (e *Engine) downloadFileSingle(ctx context.Context, cfg config.Config, u, parentDir, rel string, rem FileMeta) (string, int64, string, error) {
+	transferCtx, cancel := context.WithTimeout(ctx, transferTimeout(rem.Size))
+	defer cancel()
+	stall := newStallWatch()
+	stopStall := watchStall(stall, stallTimeout(), cancel)
+	defer stopStall()
+	resp, err := e.fetchRemoteFile(transferCtx, ctx, cfg, u)
+	if err != nil {
+		if transferCanceled(ctx, err) {
+			return "", 0, "", context.Canceled
+		}
+		return "", 0, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, "", remoteStatusError("下载文件", resp.StatusCode, "")
+	}
+
+	var randBuf [6]byte
+	_, _ = rand.Read(randBuf[:])
+	tmpPath := filepath.Join(parentDir, fmt.Sprintf(".synct.tmp.%s", hex.EncodeToString(randBuf[:])))
+
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return "", 0, "", fmt.Errorf("创建临时文件失败: %w", err)
+	}
+
+	hasher := sha256.New()
+	buf := ioBufferPool.Get().(*[]byte)
+	written, copyErr := io.CopyBuffer(io.MultiWriter(&progressWriter{w: tmpFile, onMove: e.countDownloadBytes, stall: stall}, hasher), resp.Body, *buf)
+	ioBufferPool.Put(buf)
+	closeErr := tmpFile.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(tmpPath)
+		if copyErr != nil && transferCanceled(ctx, copyErr) {
+			return "", 0, "", context.Canceled
+		}
+		if copyErr != nil && stall.stalledFor(time.Now()) >= stallTimeout() {
+			e.index.SetFileStatus(rel, StatusError, "传输停滞")
+			return "", 0, "", fmt.Errorf("下载停滞超过 %s，已放弃本次传输 (%s)", stallTimeout(), rel)
+		}
+		if copyErr != nil {
+			return "", 0, "", fmt.Errorf("写入下载文件失败: %w", copyErr)
+		}
+		return "", 0, "", fmt.Errorf("关闭下载文件失败: %w", closeErr)
+	}
+	return tmpPath, written, hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// downloadFileResumable downloads rem in HTTP Range chunks into a deterministic
+// .synct.part file so an interrupted large download resumes where it left off.
+// Falls back cleanly to a full 200 OK body if the peer does not support Range.
+func (e *Engine) downloadFileResumable(ctx context.Context, cfg config.Config, u, parentDir, rel string, rem FileMeta) (string, int64, string, error) {
+	tmpPath := partFilePath(parentDir, rel, rem.SHA256)
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return "", 0, "", fmt.Errorf("创建断点续传临时文件失败: %w", err)
+	}
+	fileOpen := true
+	closeFile := func() error {
+		if !fileOpen {
+			return nil
+		}
+		fileOpen = false
+		return tmpFile.Close()
+	}
+	defer closeFile()
+
+	info, err := tmpFile.Stat()
+	if err != nil {
+		return "", 0, "", fmt.Errorf("读取临时文件信息失败: %w", err)
+	}
+	offset := info.Size()
+	if offset > rem.Size {
+		if err := tmpFile.Truncate(0); err != nil {
+			return "", 0, "", err
+		}
+		offset = 0
+	} else if offset == rem.Size {
+		// Previous attempt already fetched every byte; verify before re-fetching.
+		if err := closeFile(); err != nil {
+			return "", 0, "", err
+		}
+		if existingHash, hashErr := HashFile(tmpPath); hashErr == nil && strings.EqualFold(existingHash, rem.SHA256) {
+			return tmpPath, rem.Size, existingHash, nil
+		}
+		tmpFile, err = os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+		if err != nil {
+			return "", 0, "", fmt.Errorf("重置断点续传临时文件失败: %w", err)
+		}
+		fileOpen = true
+		offset = 0
+	}
+
+	chunkSize := downloadChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 4 << 20
+	}
+
+	zeroProgressFailures := 0
+	for offset < rem.Size {
+		if ctx.Err() != nil {
+			return "", 0, "", context.Canceled
+		}
+		chunkEnd := offset + chunkSize - 1
+		if chunkEnd >= rem.Size {
+			chunkEnd = rem.Size - 1
+		}
+		expectedLen := chunkEnd - offset + 1
+
+		transferCtx, cancel := context.WithTimeout(ctx, transferTimeout(expectedLen))
+		stall := newStallWatch()
+		stopStall := watchStall(stall, stallTimeout(), cancel)
+
+		resp, reqErr := e.fetchRemoteRange(transferCtx, ctx, cfg, u, offset, chunkEnd)
+		if reqErr != nil {
+			stopStall()
+			cancel()
+			if transferCanceled(ctx, reqErr) {
+				return "", 0, "", context.Canceled
+			}
+			// Keep the partial file on disk so the next reconciliation resumes.
+			return "", 0, "", reqErr
+		}
+
+		switch resp.StatusCode {
+		case http.StatusRequestedRangeNotSatisfiable:
+			resp.Body.Close()
+			stopStall()
+			cancel()
+			_ = closeFile()
+			_ = os.Remove(tmpPath)
+			return "", 0, "", fmt.Errorf("远端文件大小已变更 (HTTP 416): %s", rel)
+
+		case http.StatusOK:
+			// Peer returned the full file (no Range support): write from byte 0.
+			if err := tmpFile.Truncate(0); err != nil {
+				resp.Body.Close()
+				stopStall()
+				cancel()
+				return "", 0, "", err
+			}
+			if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+				resp.Body.Close()
+				stopStall()
+				cancel()
+				return "", 0, "", err
+			}
+			hasher := sha256.New()
+			buf := ioBufferPool.Get().(*[]byte)
+			written, copyErr := io.CopyBuffer(io.MultiWriter(&progressWriter{w: tmpFile, onMove: e.countDownloadBytes, stall: stall}, hasher), resp.Body, *buf)
+			ioBufferPool.Put(buf)
+			resp.Body.Close()
+			stopStall()
+			cancel()
+			closeErr := closeFile()
+			if copyErr != nil || closeErr != nil {
+				_ = os.Remove(tmpPath)
+				if copyErr != nil && transferCanceled(ctx, copyErr) {
+					return "", 0, "", context.Canceled
+				}
+				if copyErr != nil && stall.stalledFor(time.Now()) >= stallTimeout() {
+					e.index.SetFileStatus(rel, StatusError, "传输停滞")
+					return "", 0, "", fmt.Errorf("下载停滞超过 %s，已放弃本次传输 (%s)", stallTimeout(), rel)
+				}
+				if copyErr != nil {
+					return "", 0, "", fmt.Errorf("写入下载文件失败: %w", copyErr)
+				}
+				return "", 0, "", fmt.Errorf("关闭下载文件失败: %w", closeErr)
+			}
+			return tmpPath, written, hex.EncodeToString(hasher.Sum(nil)), nil
+
+		case http.StatusPartialContent:
+			serverHash := strings.TrimSpace(resp.Header.Get("X-SyncT-SHA256"))
+			if serverHash != "" && !strings.EqualFold(serverHash, rem.SHA256) {
+				resp.Body.Close()
+				stopStall()
+				cancel()
+				_ = closeFile()
+				_ = os.Remove(tmpPath)
+				return "", 0, "", fmt.Errorf("远端文件在下载期间已变更 (%s)", rel)
+			}
+			contentRange := strings.TrimSpace(resp.Header.Get("Content-Range"))
+			expectedPrefix := fmt.Sprintf("bytes %d-", offset)
+			if !strings.HasPrefix(contentRange, expectedPrefix) {
+				resp.Body.Close()
+				stopStall()
+				cancel()
+				_ = closeFile()
+				_ = os.Remove(tmpPath)
+				return "", 0, "", fmt.Errorf("远端返回异常分段范围 (%s): %s", contentRange, rel)
+			}
+			if _, err := tmpFile.Seek(offset, io.SeekStart); err != nil {
+				resp.Body.Close()
+				stopStall()
+				cancel()
+				return "", 0, "", err
+			}
+			if err := tmpFile.Truncate(offset); err != nil {
+				resp.Body.Close()
+				stopStall()
+				cancel()
+				return "", 0, "", err
+			}
+			buf := ioBufferPool.Get().(*[]byte)
+			n, copyErr := io.CopyBuffer(&progressWriter{w: tmpFile, onMove: e.countDownloadBytes, stall: stall}, io.LimitReader(resp.Body, expectedLen), *buf)
+			ioBufferPool.Put(buf)
+			resp.Body.Close()
+			stalled := stall.stalledFor(time.Now()) >= stallTimeout()
+			stopStall()
+			cancel()
+
+			if n > 0 {
+				offset += n
+				_ = tmpFile.Truncate(offset)
+				zeroProgressFailures = 0
+			}
+			if copyErr != nil {
+				if transferCanceled(ctx, copyErr) {
+					return "", 0, "", context.Canceled
+				}
+				if stalled {
+					e.index.SetFileStatus(rel, StatusError, "传输停滞")
+					return "", 0, "", fmt.Errorf("下载停滞超过 %s，已放弃本次传输 (%s)", stallTimeout(), rel)
+				}
+				if n > 0 {
+					// Partial progress persisted on disk; resume immediately from new offset.
+					continue
+				}
+				zeroProgressFailures++
+				if zeroProgressFailures >= 3 {
+					return "", 0, "", fmt.Errorf("分块下载文件失败: %w", copyErr)
+				}
+				time.Sleep(time.Duration(zeroProgressFailures) * 200 * time.Millisecond)
+				continue
+			}
+			if n == 0 {
+				zeroProgressFailures++
+				if zeroProgressFailures >= 3 {
+					return "", 0, "", fmt.Errorf("远端分段响应提前结束 (%s)", rel)
+				}
+				time.Sleep(time.Duration(zeroProgressFailures) * 200 * time.Millisecond)
+				continue
+			}
+
+		default:
+			status := resp.StatusCode
+			resp.Body.Close()
+			stopStall()
+			cancel()
+			if status == http.StatusNotFound || status == http.StatusForbidden || status == http.StatusUnauthorized {
+				_ = closeFile()
+				_ = os.Remove(tmpPath)
+			}
+			return "", 0, "", remoteStatusError("下载文件", status, "")
+		}
+	}
+
+	if err := closeFile(); err != nil {
+		return "", 0, "", fmt.Errorf("关闭下载文件失败: %w", err)
+	}
+	actualHash, err := HashFile(tmpPath)
+	if err != nil {
+		return "", 0, "", fmt.Errorf("校验下载文件失败: %w", err)
+	}
+	return tmpPath, offset, actualHash, nil
+}
+
 func (e *Engine) pullFile(ctx context.Context, cfg config.Config, rem FileMeta, saveConflict, retried bool) error {
 	rel, ok := CleanRelPath(rem.RelPath)
 	if !ok {
@@ -1956,14 +2450,26 @@ func (e *Engine) pullFile(ctx context.Context, cfg config.Config, rem FileMeta, 
 	e.index.SetFileStatus(rel, StatusDownloading, "远端 -> 本地")
 	e.notifyUI()
 
+	parentDir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+		e.index.SetFileStatus(rel, StatusError, "下载失败")
+		return fmt.Errorf("创建目标目录失败: %w", err)
+	}
+
 	baseURL := config.NormalizeRemoteURL(cfg.RemoteURL)
 	u := fmt.Sprintf("%s/api/file?path=%s", baseURL, url.QueryEscape(rel))
-	transferCtx, cancel := context.WithTimeout(ctx, transferTimeout(rem.Size))
-	defer cancel()
-	stall := newStallWatch()
-	stopStall := watchStall(stall, stallTimeout(), cancel)
-	defer stopStall()
-	resp, err := e.fetchRemoteFile(transferCtx, ctx, cfg, u)
+
+	var (
+		tmpPath    string
+		written    int64
+		actualHash string
+		err        error
+	)
+	if rem.Size > 0 && rem.Size >= resumableDownloadThreshold && rem.SHA256 != "" {
+		tmpPath, written, actualHash, err = e.downloadFileResumable(ctx, cfg, u, parentDir, rel, rem)
+	} else {
+		tmpPath, written, actualHash, err = e.downloadFileSingle(ctx, cfg, u, parentDir, rel, rem)
+	}
 	if err != nil {
 		if transferCanceled(ctx, err) {
 			e.index.SetFileStatus(rel, StatusPending, "等待重试")
@@ -1972,47 +2478,7 @@ func (e *Engine) pullFile(ctx context.Context, cfg config.Config, rem FileMeta, 
 		e.index.SetFileStatus(rel, StatusError, "下载失败")
 		return err
 	}
-	defer resp.Body.Close()
 
-	parentDir := filepath.Dir(fullPath)
-	if err := os.MkdirAll(parentDir, 0o755); err != nil {
-		e.index.SetFileStatus(rel, StatusError, "下载失败")
-		return fmt.Errorf("创建目标目录失败: %w", err)
-	}
-
-	var randBuf [6]byte
-	_, _ = rand.Read(randBuf[:])
-	tmpPath := filepath.Join(parentDir, fmt.Sprintf(".synct.tmp.%s", hex.EncodeToString(randBuf[:])))
-
-	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		e.index.SetFileStatus(rel, StatusError, "下载失败")
-		return fmt.Errorf("创建临时文件失败: %w", err)
-	}
-
-	hasher := sha256.New()
-	buf := ioBufferPool.Get().(*[]byte)
-	written, copyErr := io.CopyBuffer(io.MultiWriter(&progressWriter{w: tmpFile, onMove: e.countDownloadBytes, stall: stall}, hasher), resp.Body, *buf)
-	ioBufferPool.Put(buf)
-	closeErr := tmpFile.Close()
-	if copyErr != nil || closeErr != nil {
-		_ = os.Remove(tmpPath)
-		if copyErr != nil && transferCanceled(ctx, copyErr) {
-			e.index.SetFileStatus(rel, StatusPending, "等待重试")
-			return context.Canceled
-		}
-		if copyErr != nil && stall.stalledFor(time.Now()) >= stallTimeout() {
-			e.index.SetFileStatus(rel, StatusError, "传输停滞")
-			return fmt.Errorf("下载停滞超过 %s，已放弃本次传输 (%s)", stallTimeout(), rel)
-		}
-		e.index.SetFileStatus(rel, StatusError, "下载失败")
-		if copyErr != nil {
-			return fmt.Errorf("写入下载文件失败: %w", copyErr)
-		}
-		return fmt.Errorf("关闭下载文件失败: %w", closeErr)
-	}
-
-	actualHash := hex.EncodeToString(hasher.Sum(nil))
 	if rem.SHA256 != "" && !strings.EqualFold(rem.SHA256, actualHash) {
 		_ = os.Remove(tmpPath)
 		// A digest mismatch usually means the body was truncated or corrupted

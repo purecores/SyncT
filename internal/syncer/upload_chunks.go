@@ -60,8 +60,14 @@ func hexSafe(name string) string {
 }
 
 func (s *Server) handleUploadBegin(w http.ResponseWriter, r *http.Request) {
+	setWriteDeadline(w, 2*time.Minute)
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg := s.engine.Config()
+	if cfg.SyncDirection == config.SyncPushOnly {
+		http.Error(w, "forbidden: server is push-only", http.StatusForbidden)
 		return
 	}
 	defer r.Body.Close()
@@ -70,7 +76,6 @@ func (s *Server) handleUploadBegin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid upload request", http.StatusBadRequest)
 		return
 	}
-	cfg := s.engine.Config()
 	relPath, ok := CleanRelPath(req.Path)
 	if !ok {
 		http.Error(w, "invalid relative path", http.StatusBadRequest)
@@ -95,6 +100,12 @@ func (s *Server) handleUploadBegin(w http.ResponseWriter, r *http.Request) {
 	if req.UploadID != "" {
 		if up := s.uploads[req.UploadID]; up != nil && up.key == key {
 			up.mu.Lock()
+			if up.done || up.committing {
+				up.mu.Unlock()
+				s.uploadsMu.Unlock()
+				http.Error(w, "upload already committing or finished", http.StatusConflict)
+				return
+			}
 			resp := uploadBeginResponse{UploadID: up.id, Received: up.received, Chunk: maxUploadChunkBytes}
 			up.lastActive = time.Now()
 			up.mu.Unlock()
@@ -132,7 +143,6 @@ func (s *Server) handleUploadBegin(w http.ResponseWriter, r *http.Request) {
 		expected:   strings.TrimSpace(req.SHA256),
 		baseHash:   strings.TrimSpace(req.BaseHash),
 		originNode: strings.TrimSpace(r.Header.Get("X-SyncT-Node")),
-		hasher:     sha256.New(),
 		createdAt:  now,
 		lastActive: now,
 	}
@@ -153,8 +163,13 @@ func (s *Server) lookupUpload(id string) *chunkUpload {
 }
 
 func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
+	setWriteDeadline(w, 2*time.Minute)
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine.Config().SyncDirection == config.SyncPushOnly {
+		http.Error(w, "forbidden: server is push-only", http.StatusForbidden)
 		return
 	}
 	defer r.Body.Close()
@@ -167,6 +182,10 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	up.mu.Lock()
 	defer up.mu.Unlock()
+	if up.done || up.committing {
+		http.Error(w, "upload already committing or finished", http.StatusConflict)
+		return
+	}
 	if offset != up.received {
 		writeJSON(w, uploadBeginResponse{UploadID: up.id, Received: up.received, Chunk: maxUploadChunkBytes})
 		return
@@ -175,21 +194,38 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "chunk too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	f, err := os.OpenFile(up.tmpPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(up.tmpPath, os.O_WRONLY, 0o644)
 	if err != nil {
 		http.Error(w, "upload session lost", http.StatusGone)
 		return
 	}
+	if err := f.Truncate(up.received); err != nil {
+		_ = f.Close()
+		http.Error(w, "failed to prepare chunk file", http.StatusInternalServerError)
+		return
+	}
+	if _, err := f.Seek(up.received, io.SeekStart); err != nil {
+		_ = f.Close()
+		http.Error(w, "failed to seek chunk file", http.StatusInternalServerError)
+		return
+	}
 	buf := ioBufferPool.Get().(*[]byte)
-	n, copyErr := io.CopyBuffer(io.MultiWriter(f, up.hasher), io.LimitReader(r.Body, maxUploadChunkBytes+1), *buf)
+	n, copyErr := io.CopyBuffer(f, io.LimitReader(r.Body, maxUploadChunkBytes+1), *buf)
 	ioBufferPool.Put(buf)
 	closeErr := f.Close()
 	if copyErr != nil || closeErr != nil {
+		_ = os.Truncate(up.tmpPath, up.received)
 		http.Error(w, "failed to write chunk", http.StatusInternalServerError)
 		return
 	}
 	if n > maxUploadChunkBytes {
+		_ = os.Truncate(up.tmpPath, up.received)
 		http.Error(w, "chunk too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if up.received+n > up.size {
+		_ = os.Truncate(up.tmpPath, up.received)
+		http.Error(w, "chunk exceeds upload size", http.StatusBadRequest)
 		return
 	}
 	up.received += n
@@ -199,8 +235,13 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUploadCommit(w http.ResponseWriter, r *http.Request) {
+	setWriteDeadline(w, 2*time.Minute)
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine.Config().SyncDirection == config.SyncPushOnly {
+		http.Error(w, "forbidden: server is push-only", http.StatusForbidden)
 		return
 	}
 	id := r.URL.Query().Get("id")
@@ -210,20 +251,34 @@ func (s *Server) handleUploadCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	up.mu.Lock()
+	if up.done || up.committing {
+		up.mu.Unlock()
+		http.Error(w, "upload already committing or finished", http.StatusConflict)
+		return
+	}
+	if up.received != up.size {
+		received, size := up.received, up.size
+		up.mu.Unlock()
+		s.discardUpload(up)
+		http.Error(w, fmt.Sprintf("incomplete upload: %d/%d bytes", received, size), http.StatusConflict)
+		return
+	}
+	up.committing = true
 	relPath := up.relPath
 	received, size := up.received, up.size
-	actual := hex.EncodeToString(up.hasher.Sum(nil))
 	expected := up.expected
 	tmpPath, fullPath := up.tmpPath, up.fullPath
 	mtimeMs, baseHash, originNode := up.mtime, up.baseHash, up.originNode
 	up.mu.Unlock()
+	_ = size
 
 	fail := func(status int, msg string) {
 		s.discardUpload(up)
 		http.Error(w, msg, status)
 	}
-	if received != size {
-		fail(http.StatusConflict, fmt.Sprintf("incomplete upload: %d/%d bytes", received, size))
+	actual, hashErr := HashFile(tmpPath)
+	if hashErr != nil {
+		fail(http.StatusInternalServerError, "failed to hash uploaded file: "+hashErr.Error())
 		return
 	}
 	if expected != "" && !strings.EqualFold(expected, actual) {
@@ -236,7 +291,7 @@ func (s *Server) handleUploadCommit(w http.ResponseWriter, r *http.Request) {
 	if existingInfo, statErr := os.Stat(fullPath); statErr == nil && existingInfo.Mode().IsRegular() {
 		existingHash, hashErr := HashFile(fullPath)
 		if hashErr == nil && existingHash != "" && existingHash != actual {
-			if cfg.ConflictPolicy == config.ConflictKeepBoth && baseHash != "" && baseHash != existingHash {
+			if cfg.ConflictPolicy == config.ConflictKeepBoth && baseHash != existingHash {
 				backupPath := ConflictBackupPath(fullPath)
 				if err := copyFileContents(fullPath, backupPath); err == nil {
 					conflictSaved = true
@@ -287,8 +342,16 @@ func (s *Server) handleUploadCommit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request) {
+	setWriteDeadline(w, 2*time.Minute)
 	id := r.URL.Query().Get("id")
 	if up := s.lookupUpload(id); up != nil {
+		up.mu.Lock()
+		committing := up.committing
+		up.mu.Unlock()
+		if committing {
+			http.Error(w, "upload already committing", http.StatusConflict)
+			return
+		}
 		s.discardUpload(up)
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -351,8 +414,9 @@ func (s *Server) expireUploads() {
 	for _, up := range s.uploads {
 		up.mu.Lock()
 		last := up.lastActive
+		committing := up.committing
 		up.mu.Unlock()
-		if last.Before(cutoff) {
+		if !committing && last.Before(cutoff) {
 			stale = append(stale, up)
 		}
 	}

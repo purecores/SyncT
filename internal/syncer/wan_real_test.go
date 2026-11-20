@@ -16,7 +16,7 @@ import (
 // behind the Cloudflare tunnel. It is manual because it needs a live host and
 // its pairing key:
 //
-//	SYNCT_REAL_CONFIG=D:\APP\SyncT-Host-Server\data\config.json \
+//	SYNCT_REAL_CONFIG=C:\SyncT-Host\data\config.json \
 //	go test ./internal/syncer -run TestRealTunnelTransfer -v -timeout 30m
 //
 // It pushes one uniquely named probe file and checks the host's copy byte for

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -298,10 +299,10 @@ func (app *App) StopAll() {
 	app.updateKeepAwake(false)
 }
 
-// fixTunnelTLS installs the portable origin certificate into the Windows
-// trusted root store (with a UAC prompt) and restarts cloudflared, so its
-// origin connection stops failing with "certificate signed by unknown
-// authority" — the cause of the public 502.
+// fixTunnelTLS installs the localhost-only, name-constrained local CA
+// certificate (no CA private key is stored on disk) into the Windows trusted
+// root store via certutil.exe (with a UAC prompt), so cloudflared's origin
+// connection stops failing with "certificate signed by unknown authority".
 func (app *App) fixTunnelTLS() {
 	if err := syncer.InstallLocalTrust(); err != nil {
 		app.engine.LogLevel("ERROR", "修复 502 失败: "+err.Error())
@@ -309,8 +310,8 @@ func (app *App) fixTunnelTLS() {
 		app.requestRedraw()
 		return
 	}
-	app.engine.Logf("已请求安装本地证书并重启 cloudflared；约 10 秒后会自动复检公网入口")
-	app.pendingToast = "已提交证书信任修复，公网入口将在 cloudflared 重启后恢复"
+	app.engine.Logf("已通过 certutil 提交仅限 localhost 的受限 CA 证书安装（CA 私钥不落盘）；若 502 仍存在，请重启 cloudflared 服务或在 Cloudflare Zero Trust 中开启 noTLSVerify")
+	app.pendingToast = "已提交 localhost CA 证书安装；若 502 持续请重启 cloudflared 服务或开启 noTLSVerify"
 	app.requestRedraw()
 }
 
@@ -487,7 +488,7 @@ func (app *App) buildHeader(c *ui.Context, t *ui.Theme, stats syncer.Stats) {
 			if app.cfg.Role == config.RoleHost && stats.TLSRejected {
 				if m.Item("修复 502 (信任本地证书)").Chosen() {
 					go app.fixTunnelTLS()
-					app.pendingToast = "正在请求管理员权限安装本地证书并重启 cloudflared…"
+					app.pendingToast = "正在通过 certutil 请求管理员权限安装仅限 localhost 的本地 CA 证书…"
 					app.requestRedraw()
 				}
 			}
@@ -796,9 +797,9 @@ func (app *App) buildConnectionPanel(c *ui.Context, t *ui.Theme, stats syncer.St
 				app.copyShareCode(c)
 			}
 			if app.cfg.Role == config.RoleHost && stats.TLSRejected {
-				if ui.Button(c.Key("btn-fix-502"), "修复 502").Tooltip("将本地自签名证书安装到受信任根，并重启 cloudflared").Clicked() {
+				if ui.Button(c.Key("btn-fix-502"), "修复 502").Tooltip("通过 certutil 安装仅限 localhost 的受限 CA 证书到受信任根（不落盘 CA 私钥）").Clicked() {
 					go app.fixTunnelTLS()
-					c.Toast("正在请求管理员权限安装本地证书并重启 cloudflared…")
+					c.Toast("正在通过 certutil 请求管理员权限安装仅限 localhost 的本地 CA 证书…")
 				}
 			}
 		})
@@ -1220,7 +1221,7 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 
 						if app.cfg.TunnelMode == config.TunnelSystem || app.cfg.TunnelMode == config.TunnelToken {
 							ui.Field(c, "公网域名", func() {
-								if ui.TextInput(c.Key("input-custom-pub-url"), &app.cfg.CustomPublicURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
+								if ui.TextInput(c.Key("input-custom-pub-url"), &app.cfg.CustomPublicURL).Placeholder("https://sync.example.com").Changed() {
 									app.saveConfig()
 								}
 							}).Description("Cloudflared 入站规则绑定的域名")
@@ -1270,7 +1271,7 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 							remoteErr = "请填写 Cloudflared 隧道域名"
 						}
 						ui.Field(c, "远端地址", func() {
-							if ui.TextInput(c.Key("input-remote-url"), &app.cfg.RemoteURL).Placeholder("https://synctreei.suosmanthus.cyou").Changed() {
+							if ui.TextInput(c.Key("input-remote-url"), &app.cfg.RemoteURL).Placeholder("https://sync.example.com").Changed() {
 								app.saveConfig()
 								app.engine.UpdateConfig(app.cfg)
 							}
@@ -1375,11 +1376,18 @@ func (app *App) buildSettingsPage(c *ui.Context, t *ui.Theme) {
 			})
 
 			ui.Column(c).Gap(t.Space(0.5)).Children(func() {
+				defSyncDir := strings.TrimSpace(os.Getenv("SYNCT_DEFAULT_SYNC_DIR"))
+				if defSyncDir == "" {
+					defSyncDir = config.PreferredSyncDir
+				}
+				if defSyncDir == "" {
+					defSyncDir = filepath.Join(config.PortableRoot(), "SyncFolder")
+				}
 				ui.Textf(c, "数据目录  %s", config.DataDir()).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
 				ui.Textf(c, "配置  %s", config.ConfigPath()).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
 				ui.Textf(c, "索引  %s", config.StatePath()).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
 				ui.Textf(c, "日志  %s (上限 2MB)", filepath.Join(config.PortableRoot(), "SyncT.log")).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
-				ui.Textf(c, "默认同步目录  %s（两台电脑相同）", config.PreferredSyncDir).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
+				ui.Textf(c, "默认同步目录  %s", defSyncDir).TextColor(t.TextMuted).FontSize(t.Rem(0.78)).SingleLine()
 			})
 		})
 	})

@@ -349,7 +349,7 @@ func (m *Manager) Start(cfg config.Config, localPort int) error {
 	case config.TunnelToken:
 		tok := strings.TrimSpace(cfg.TunnelToken)
 		if tok == "" {
-			err := errors.New("Token Tunnel 模式需要填写 Cloudflare 隧道 Token (用于绑定 synctreei.suosmanthus.cyou -> https://localhost:18920)")
+			err := errors.New("Token Tunnel 模式需要填写 Cloudflare 隧道 Token (用于将公网域名转发至 https://localhost:18920)")
 			m.mu.Lock()
 			m.state = TunnelError
 			m.lastErr = err.Error()

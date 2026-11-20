@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-echo [SyncT] 1/3 正在生成 bailian-color.png 应用图标与 asInvoker 权限清单资源 (.syso)...
+echo [SyncT] 1/3 正在生成应用图标与 asInvoker 权限清单资源 (.syso)...
 set CGO_ENABLED=0
 go test -run TestGenerateWindowsSysoAndICO ./internal/winres
 if %ERRORLEVEL% neq 0 (
@@ -18,6 +18,7 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo [SyncT] 3/3 正在打包 Release ZIP 发布包 (本机服务端 + 工作电脑 User 低权限客户端)...
+set SYNCT_BUILD_RELEASE=1
 go test -run TestPackagePortableReleaseZIPs ./internal/winres
 if %ERRORLEVEL% neq 0 (
     echo [错误] 打包 Release ZIP 失败！

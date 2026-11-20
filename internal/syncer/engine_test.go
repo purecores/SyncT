@@ -133,7 +133,7 @@ func TestBidirectionalSyncAndDeletions(t *testing.T) {
 }
 
 func TestShareCodeRoundTrip(t *testing.T) {
-	origURL := "https://synctreei.suosmanthus.cyou"
+	origURL := "https://sync.example.com"
 	origToken := "st_9f8e7d6c5b4a"
 	code := config.EncodeShareCode(origURL, origToken)
 	if !strings.HasPrefix(code, "synct://connect/") {
@@ -147,7 +147,7 @@ func TestShareCodeRoundTrip(t *testing.T) {
 		t.Fatalf("got (%q, %q), want (%q, %q)", gotURL, gotToken, origURL, origToken)
 	}
 
-	// Also verify pasting raw st_ token pairs with https://synctreei.suosmanthus.cyou
+	// Also verify pasting raw st_ token pairs with DefaultPublicURL
 	gotURL2, gotTok2, err := config.DecodeShareCode("st_work_pc_token_123")
 	if err != nil || gotURL2 != config.DefaultPublicURL || gotTok2 != "st_work_pc_token_123" {
 		t.Fatalf("raw token decode = (%q, %q, %v)", gotURL2, gotTok2, err)
@@ -233,6 +233,7 @@ func TestMultiFolderAndCrossTargetMappingSync(t *testing.T) {
 	hostCfg.SyncDir = hostMainDir
 	hostCfg.LocalPort = 0
 	hostCfg.AuthToken = token
+	hostCfg.AllowPeerRemotePath = true
 	hostCfg.SyncFolders = []config.FolderMapping{
 		{
 			ID:        config.DefaultFolderID,
@@ -264,6 +265,7 @@ func TestMultiFolderAndCrossTargetMappingSync(t *testing.T) {
 	clientCfg.SyncDir = clientMainDir
 	clientCfg.RemoteURL = fmt.Sprintf("https://localhost:%d", port)
 	clientCfg.AuthToken = token
+	clientCfg.AllowPeerRemotePath = true
 
 	clientEngine := NewEngine(clientCfg, filepath.Join(tmpRoot, "client_state.json"), nil)
 	if err := clientEngine.ReconcileWithRemote(context.Background()); err != nil {

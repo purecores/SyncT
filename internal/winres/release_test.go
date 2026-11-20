@@ -7,12 +7,18 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 
 	"synct/internal/config"
 )
 
 func TestPackagePortableReleaseZIPs(t *testing.T) {
+	if os.Getenv("SYNCT_BUILD_RELEASE") != "1" {
+		t.Skip("set SYNCT_BUILD_RELEASE=1 to package portable release ZIPs")
+	}
+
 	rootDir, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -24,15 +30,13 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 		t.Skip("SyncT.exe not built yet; skipping release packaging")
 	}
 
-	// Clean up any bundled bin/cloudflared.exe since the Host machine already runs system cloudflared
-	_ = os.RemoveAll(filepath.Join(rootDir, "bin"))
-
 	releaseDir := filepath.Join(rootDir, "release")
 	if err := os.MkdirAll(releaseDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Preserve existing auth_token if root data/config.json already has one, or generate a new shared token
+	// Preserve existing auth_token if root data/config.json already has one, or generate a new shared token.
+	// Never overwrite the repo root's data/config.json; keep generated configs in memory for the ZIPs.
 	sharedToken := config.GenerateToken()
 	rootCfgPath := filepath.Join(rootDir, "data", "config.json")
 	if raw, err := os.ReadFile(rootCfgPath); err == nil {
@@ -42,46 +46,55 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 		}
 	}
 
-	// 1. Prepare Host (Server) Config: Reuses system's already-running Cloudflared -> synctreei.suosmanthus.cyou -> https://localhost:18920
+	publicURL := config.NormalizeRemoteURL(os.Getenv("SYNCT_PUBLIC_URL"))
+	guideURL := publicURL
+	if guideURL == "" {
+		guideURL = "https://sync.example.com"
+	}
+	guideHost := strings.TrimPrefix(strings.TrimPrefix(guideURL, "https://"), "http://")
+	defaultSyncDir := strings.TrimSpace(os.Getenv("SYNCT_DEFAULT_SYNC_DIR"))
+
+	// Remove archives from earlier versions so release/ only ever holds one
+	// versioned set; the EXE inside each ZIP carries its own version too.
+	pruneOldReleaseZips(t, releaseDir)
+
+	// 1. Prepare Host (Server) Config: Reuses system's already-running Cloudflared -> publicURL -> https://localhost:18920
 	hostCfg := config.Default()
 	hostCfg.Role = config.RoleHost
 	hostCfg.TunnelMode = config.TunnelSystem
-	hostCfg.CustomPublicURL = config.DefaultPublicURL
-	hostCfg.RemoteURL = config.DefaultPublicURL
+	hostCfg.CustomPublicURL = publicURL
+	hostCfg.RemoteURL = publicURL
 	hostCfg.LocalPort = config.DefaultLocalPort
 	hostCfg.LocalTLS = true
 	hostCfg.LowPrivilegeMode = true
 	hostCfg.AuthToken = sharedToken
-	hostCfg.SyncDir = config.PreferredSyncDir
+	hostCfg.SyncDir = defaultSyncDir
 	// The host must be listening whenever the public hostname is opened;
 	// otherwise every first request from the work PC is a 502.
 	hostCfg.AutoStartSync = true
-
-	// Also save to root ./data/config.json for in-place use on this Host machine
-	_ = os.MkdirAll(filepath.Join(rootDir, "data"), 0o755)
 	hostCfgBytes, _ := json.MarshalIndent(hostCfg, "", "  ")
-	_ = os.WriteFile(rootCfgPath, hostCfgBytes, 0o600)
 
 	// 2. Prepare Work PC (Client) Config: User-privilege restrained mode, pre-paired with Host's AuthToken
 	clientCfg := config.Default()
 	clientCfg.Role = config.RoleClient
 	clientCfg.TunnelMode = config.TunnelSystem
-	clientCfg.CustomPublicURL = config.DefaultPublicURL
-	clientCfg.RemoteURL = config.DefaultPublicURL
+	clientCfg.CustomPublicURL = publicURL
+	clientCfg.RemoteURL = publicURL
 	clientCfg.LocalPort = config.DefaultLocalPort
 	clientCfg.LocalTLS = true
 	clientCfg.LowPrivilegeMode = true
 	clientCfg.AuthToken = sharedToken
-	clientCfg.SyncDir = config.PreferredSyncDir
+	clientCfg.SyncDir = defaultSyncDir
 	clientCfgBytes, _ := json.MarshalIndent(clientCfg, "", "  ")
 
-	shareCode := config.EncodeShareCode(config.DefaultPublicURL, sharedToken)
+	shareCode := config.EncodeShareCode(guideURL, sharedToken)
 
-	guideContent := fmt.Sprintf(`# SyncT 个人双机专属便携版 (Portable Release) 使用说明
+	guideContent := fmt.Sprintf(`# SyncT 个人双机专属便携版 (Portable Release) v%s 使用说明
 
 ## 1. 架构概览
 
-- **专属公网域名**: `+"`https://synctreei.suosmanthus.cyou`"+`
+- **版本**: v%s
+- **公网域名**: `+"`%s`"+`
 - **本机隧道模式**: **直接复用本机系统已运行的 Cloudflared 服务/进程**（无需再次填写 Token，也无需由软件重复拉起 `+"`cloudflared.exe`"+`）
 - **本机服务端监听**: `+"`https://localhost:18920`"+` (仅绑定 `+"`127.0.0.1` / `::1`"+` 本地回环，内建自签名 TLS 证书并同时兼容 HTTPS 与 HTTP)
 - **预配对安全访问密钥 (Auth Token)**: `+"`%s`"+`
@@ -92,8 +105,8 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 
 ## 2. 本机服务端 (`+"`SyncT-Host-Server`"+`) 使用步骤
 
-1. 本机系统的 `+"`cloudflared`"+` 已在后台运行并将 `+"`synctreei.suosmanthus.cyou`"+` 转发至 `+"`https://localhost:18920`"+`（入站规则需配置 `+"`noTLSVerify: true`"+`，或直接转发到 `+"`http://localhost:18920`"+`）。
-2. 双击运行 `+"`SyncT.exe`"+`（已默认预设为 **主机模式 + 复用系统已运行的 Cloudflared (`+"`System Tunnel`"+`) + `+"`https://synctreei.suosmanthus.cyou`"+` + 端口 `+"`18920`"+`，并已默认开启「自动启动同步」，保证公网入口被访问时本地源站正在监听）。
+1. 本机系统的 `+"`cloudflared`"+` 已在后台运行并将 `+"`%s`"+` 转发至 `+"`https://localhost:18920`"+`（入站规则需配置 `+"`noTLSVerify: true`"+`，或直接转发到 `+"`http://localhost:18920`"+`）。
+2. 双击运行 `+"`SyncT.exe`"+`（已默认预设为 **主机模式 + 复用系统已运行的 Cloudflared (`+"`System Tunnel`"+`) + `+"`%s`"+` + 端口 `+"`18920`"+`，并已默认开启「自动启动同步」，保证公网入口被访问时本地源站正在监听）。
 3. 选择需要同步的本地文件夹，直接点击右上角 **「启动隧道并同步」** 即可（软件会自动检测并复用系统正在运行的 `+"`cloudflared`"+` 进程，无需填写 Token）。
 
 > **出现 502 Bad Gateway 时**：说明 Cloudflared 隧道在线，但它无法回源到 `+"`https://localhost:18920`"+`。请依次检查：
@@ -109,12 +122,12 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 专为仅具标准 **User 权限** 的工作电脑定制：
 - **显式内嵌 `+"`asInvoker`"+` 权限清单**：双击运行绝不触发管理员 UAC 提权弹窗。
 - **零端口监听**：工作电脑作为客户端，不调用任何 `+"`net.Listen`"+`，绝不触发 Windows 防火墙管理员弹窗。
-- **零子进程与无 `+"`cloudflared.exe`"+`**：通过标准 HTTPS (443) 直接连接 `+"`https://synctreei.suosmanthus.cyou`"+`，不附带 `+"`cloudflared.exe`"+`，避免触发企业终端安全软件告警。
+- **零子进程与无 `+"`cloudflared.exe`"+`**：通过标准 HTTPS (443) 直接连接 `+"`%s`"+`，不附带 `+"`cloudflared.exe`"+`，避免触发企业终端安全软件告警。
 - **零注册表与零系统目录写入**：所有配置文件、文件哈希索引、窗口位置状态 (`+"`window-state.json`"+`) 100%% 隔离保存在程序同级的 `+"`./data/`"+` 目录中。
 
 **操作方法**：
-1. 将 `+"`SyncT-WorkPC-Client-UserMode-Portable.zip`"+` 解压到工作电脑当前用户有读写权限的任意目录（如 `+"`D:\\Tools\\SyncT`"+` 或个人桌面/文档目录，请勿放在 `+"`C:\\Program Files`"+`）。
-2. 双击 `+"`SyncT.exe`"+`（已预先配好 **节点模式**、域名 `+"`https://synctreei.suosmanthus.cyou`"+` 及与本机一致的 **访问密钥**）。默认同步目录为 `+"`D:\\Code\\Syncwork`"+`，两台电脑相同；该路径不可用时回退到程序目录下的 `+"`SyncFolder`"+`。
+1. 将 `+"`SyncT-WorkPC-Client-UserMode-Portable`"+` 解压包（文件名带版本号，如 `+"`-v`"+` 后接版本）解压到工作电脑当前用户有读写权限的任意目录（如 `+"`D:\\Tools\\SyncT`"+` 或个人桌面/文档目录，请勿放在 `+"`C:\\Program Files`"+`）。
+2. 双击 `+"`SyncT.exe`"+`（已预先配好 **节点模式**、域名 `+"`%s`"+` 及与本机一致的 **访问密钥**）。默认同步目录为程序目录下的 `+"`SyncFolder`"+`（也可通过环境变量 `+"`SYNCT_DEFAULT_SYNC_DIR`"+` 指定统一路径）。
 3. 点击 **「浏览选择…」** 指定工作电脑上要同步的文件夹，然后点击右上角 **「连接同步」** 即可开始双向实时同步！
 
 ---
@@ -135,11 +148,12 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 - **文字可选中复制**：整个窗口的文字都可以用鼠标选中、Ctrl+A 全选、Ctrl+C 复制。
 - **日志文件**：程序同级目录的 SyncT.log，上限 2MB，超过后重新开始。
 - **同步密码**：两端输入同一密码即可派生出相同的访问密钥（PBKDF2-SHA256 12 万轮），密码本身不保存。
-- **默认目录**：两端默认 D:\Code\Syncwork。
-`, sharedToken, shareCode)
+- **默认目录**：两端默认使用程序目录下的 `+"`SyncFolder`"+`（也可通过 `+"`SYNCT_DEFAULT_SYNC_DIR`"+` 覆盖）。
+`, AppVersion, AppVersion, guideURL, sharedToken, shareCode, guideHost, guideURL, guideURL, guideURL)
+	guideContent += "\n> 本说明由构建脚本在打包时生成。发布包文件名带版本号，例如 `SyncT-WorkPC-Client-UserMode-Portable-v" + AppVersion + ".zip`、`SyncT-Host-Server-Portable-v" + AppVersion + ".zip`、`SyncT-Windows11-Portable-Release-v" + AppVersion + ".zip`。\n"
 
-	// Build 1: SyncT-WorkPC-Client-UserMode-Portable.zip
-	workZipPath := filepath.Join(releaseDir, "SyncT-WorkPC-Client-UserMode-Portable.zip")
+	// Build 1: SyncT-WorkPC-Client-UserMode-Portable-v<version>.zip
+	workZipPath := filepath.Join(releaseDir, "SyncT-WorkPC-Client-UserMode-Portable-v"+AppVersion+".zip")
 	if err := createZipArchive(workZipPath, func(zw *zip.Writer) error {
 		if err := addFileToZip(zw, exePath, "SyncT-WorkPC-Client/SyncT.exe"); err != nil {
 			return err
@@ -158,8 +172,8 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 		t.Fatalf("create WorkPC zip failed: %v", err)
 	}
 
-	// Build 2: SyncT-Host-Server-Portable.zip (uses system's already-running cloudflared)
-	hostZipPath := filepath.Join(releaseDir, "SyncT-Host-Server-Portable.zip")
+	// Build 2: SyncT-Host-Server-Portable-v<version>.zip (uses system's already-running cloudflared)
+	hostZipPath := filepath.Join(releaseDir, "SyncT-Host-Server-Portable-v"+AppVersion+".zip")
 	if err := createZipArchive(hostZipPath, func(zw *zip.Writer) error {
 		if err := addFileToZip(zw, exePath, "SyncT-Host-Server/SyncT.exe"); err != nil {
 			return err
@@ -178,8 +192,8 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 		t.Fatalf("create Host zip failed: %v", err)
 	}
 
-	// Build 3: Combined Master Release ZIP (SyncT-Windows11-Portable-Release.zip)
-	masterZipPath := filepath.Join(releaseDir, "SyncT-Windows11-Portable-Release.zip")
+	// Build 3: Combined Master Release ZIP (SyncT-Windows11-Portable-Release-v<version>.zip)
+	masterZipPath := filepath.Join(releaseDir, "SyncT-Windows11-Portable-Release-v"+AppVersion+".zip")
 	if err := createZipArchive(masterZipPath, func(zw *zip.Writer) error {
 		if err := addBytesToZip(zw, "使用说明-本机与工作电脑配置指南.md", []byte(guideContent)); err != nil {
 			return err
@@ -207,6 +221,29 @@ func TestPackagePortableReleaseZIPs(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("create Master release zip failed: %v", err)
+	}
+}
+
+// releaseZipPattern matches every ZIP this package produces (versioned or not).
+var releaseZipPattern = regexp.MustCompile(`^SyncT-[A-Za-z0-9.-]*Portable[A-Za-z0-9.-]*\.zip$|^SyncT-Windows11-Portable-Release[A-Za-z0-9.-]*\.zip$`)
+
+// pruneOldReleaseZips deletes release archives whose name does not carry the
+// current AppVersion, so a rebuilt release never leaves stale builds next to it.
+func pruneOldReleaseZips(t *testing.T, releaseDir string) {
+	t.Helper()
+	entries, err := os.ReadDir(releaseDir)
+	if err != nil {
+		return
+	}
+	keep := "-v" + AppVersion + ".zip"
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !releaseZipPattern.MatchString(name) || strings.HasSuffix(name, keep) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(releaseDir, name)); err != nil {
+			t.Logf("remove stale release archive %s: %v", name, err)
+		}
 	}
 }
 

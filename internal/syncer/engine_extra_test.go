@@ -608,6 +608,7 @@ func TestApplyPeerFolderMappings(t *testing.T) {
 	t.Setenv("SYNCT_DATA_DIR", filepath.Join(tmp, "portable"))
 	cfg := config.Default()
 	cfg.SyncDir = filepath.Join(tmp, "sync")
+	cfg.AllowPeerRemotePath = true
 	target := filepath.Join(tmp, "peer-target")
 	engine := NewEngine(cfg, filepath.Join(tmp, "state.json"), nil)
 	defer engine.Stop()

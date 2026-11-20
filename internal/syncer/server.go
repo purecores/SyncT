@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"io/fs"
 	"log"
@@ -26,16 +25,17 @@ import (
 )
 
 // SyncTProtocolVersion is reported by /api/status for compatibility checks.
-const SyncTProtocolVersion = "1.3.2"
+const SyncTProtocolVersion = "1.4.0"
 
 // SyncEventType identifies the kind of real-time change broadcast over SSE.
 type SyncEventType string
 
 const (
-	EventUpsert SyncEventType = "upsert"
-	EventDelete SyncEventType = "delete"
-	EventDir    SyncEventType = "dir"
-	EventRescan SyncEventType = "rescan"
+	EventUpsert    SyncEventType = "upsert"
+	EventDelete    SyncEventType = "delete"
+	EventDir       SyncEventType = "dir"
+	EventDirDelete SyncEventType = "dir_delete"
+	EventRescan    SyncEventType = "rescan"
 )
 
 // SyncEvent is sent over the `/api/events` SSE stream when a file changes.
@@ -78,6 +78,18 @@ type Server struct {
 
 	uploadsMu sync.Mutex
 	uploads   map[string]*chunkUpload
+
+	authMu          sync.Mutex
+	authFails       map[string]*authFailRecord
+	authMaxFailures int
+	authWindow      time.Duration
+	authLockout     time.Duration
+}
+
+type authFailRecord struct {
+	count        int
+	windowStart  time.Time
+	blockedUntil time.Time
 }
 
 // chunkUpload is one resumable upload assembled from several requests. The
@@ -96,25 +108,33 @@ type chunkUpload struct {
 	baseHash   string
 	originNode string
 	received   int64
-	hasher     hash.Hash
 	createdAt  time.Time
 	lastActive time.Time
+	committing bool
 	done       bool
 }
 
 const (
 	// maxUploadChunkBytes stays well inside what a Cloudflare-proxied request
 	// can carry and what finishes comfortably under its ~100s origin timeout.
-	maxUploadChunkBytes = 8 << 20
-	uploadSessionTTL    = 45 * time.Minute
+	maxUploadChunkBytes    = 8 << 20
+	uploadSessionTTL       = 45 * time.Minute
+	defaultAuthMaxFailures = 10
+	defaultAuthWindow      = time.Minute
+	defaultAuthLockout     = time.Minute
+	maxAuthFailEntries     = 1024
 )
 
 // NewServer constructs a sync HTTP server attached to the Engine.
 func NewServer(engine *Engine) *Server {
 	return &Server{
-		engine:  engine,
-		subs:    make(map[chan SyncEvent]*subscriber),
-		uploads: make(map[string]*chunkUpload),
+		engine:          engine,
+		subs:            make(map[chan SyncEvent]*subscriber),
+		uploads:         make(map[string]*chunkUpload),
+		authFails:       make(map[string]*authFailRecord),
+		authMaxFailures: defaultAuthMaxFailures,
+		authWindow:      defaultAuthWindow,
+		authLockout:     defaultAuthLockout,
 	}
 }
 
@@ -205,10 +225,12 @@ func (s *Server) startLocked(port int, allowLAN bool) (int, error) {
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		// Chunked uploads are many small requests; a generous per-request
-		// timeout keeps a slow 8 MB part alive without letting a stalled one
-		// hold a connection forever.
+		// read timeout keeps a slow 8 MB part alive without letting a stalled
+		// one hold a connection forever. Write deadlines are managed per
+		// handler via http.ResponseController so live SSE streams and large
+		// downloads are not cut off by a blanket server WriteTimeout.
 		ReadTimeout:    10 * time.Minute,
-		WriteTimeout:   10 * time.Minute,
+		WriteTimeout:   0,
 		MaxHeaderBytes: 1 << 20,
 		// Cloudflared's origin TLS errors used to go to a stderr nobody reads
 		// in a windowsgui build. Route them into the visible log; a rejected
@@ -388,24 +410,135 @@ func (s *Server) Broadcast(ev SyncEvent) {
 	}
 }
 
+func setWriteDeadline(w http.ResponseWriter, d time.Duration) {
+	rc := http.NewResponseController(w)
+	if d > 0 {
+		_ = rc.SetWriteDeadline(time.Now().Add(d))
+	} else {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
+			if cfIP := net.ParseIP(cf); cfIP != nil {
+				return cfIP.String()
+			}
+		}
+	}
+	if ip != nil {
+		return ip.String()
+	}
+	return host
+}
+
+func retryAfterSeconds(remaining time.Duration) int {
+	secs := int(remaining / time.Second)
+	if remaining%time.Second > 0 {
+		secs++
+	}
+	if secs < 1 {
+		return 1
+	}
+	return secs
+}
+
+func (s *Server) authLimitsLocked() (maxFailures int, window, lockout time.Duration) {
+	maxFailures = s.authMaxFailures
+	if maxFailures <= 0 {
+		maxFailures = defaultAuthMaxFailures
+	}
+	window = s.authWindow
+	if window <= 0 {
+		window = defaultAuthWindow
+	}
+	lockout = s.authLockout
+	if lockout <= 0 {
+		lockout = defaultAuthLockout
+	}
+	return maxFailures, window, lockout
+}
+
+func (s *Server) pruneAuthFailsLocked(now time.Time, window time.Duration) {
+	if len(s.authFails) <= maxAuthFailEntries {
+		return
+	}
+	for ip, rec := range s.authFails {
+		if !now.Before(rec.blockedUntil) && now.Sub(rec.windowStart) >= window {
+			delete(s.authFails, ip)
+		}
+	}
+}
+
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		expected := strings.TrimSpace(s.engine.Config().AuthToken)
-		if expected != "" {
-			got := strings.TrimSpace(r.Header.Get("X-SyncT-Token"))
-			if got == "" {
-				got = strings.TrimSpace(r.URL.Query().Get("token"))
+		if expected == "" {
+			http.Error(w, "unauthorized: server auth token not configured", http.StatusUnauthorized)
+			return
+		}
+
+		ip := clientIP(r)
+		now := time.Now()
+
+		s.authMu.Lock()
+		if rec := s.authFails[ip]; rec != nil && now.Before(rec.blockedUntil) {
+			retryAfter := retryAfterSeconds(rec.blockedUntil.Sub(now))
+			s.authMu.Unlock()
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			http.Error(w, "too many authentication failures", http.StatusTooManyRequests)
+			return
+		}
+		s.authMu.Unlock()
+
+		got := strings.TrimSpace(r.Header.Get("X-SyncT-Token"))
+		if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
+			s.authMu.Lock()
+			if s.authFails == nil {
+				s.authFails = make(map[string]*authFailRecord)
 			}
-			if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
-				http.Error(w, "unauthorized: invalid X-SyncT-Token", http.StatusUnauthorized)
+			maxFailures, window, lockout := s.authLimitsLocked()
+			s.pruneAuthFailsLocked(now, window)
+			rec := s.authFails[ip]
+			if rec == nil || now.Sub(rec.windowStart) >= window || (!rec.blockedUntil.IsZero() && !now.Before(rec.blockedUntil)) {
+				rec = &authFailRecord{count: 1, windowStart: now}
+				s.authFails[ip] = rec
+			} else {
+				rec.count++
+			}
+			if rec.count >= maxFailures {
+				rec.blockedUntil = now.Add(lockout)
+				retryAfter := retryAfterSeconds(lockout)
+				s.authMu.Unlock()
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				http.Error(w, "too many authentication failures", http.StatusTooManyRequests)
 				return
 			}
+			s.authMu.Unlock()
+			http.Error(w, "unauthorized: invalid X-SyncT-Token", http.StatusUnauthorized)
+			return
 		}
+
+		s.authMu.Lock()
+		if s.authFails != nil {
+			delete(s.authFails, ip)
+			_, window, _ := s.authLimitsLocked()
+			s.pruneAuthFailsLocked(now, window)
+		}
+		s.authMu.Unlock()
+
 		next(w, r)
 	}
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	setWriteDeadline(w, 2*time.Minute)
 	fileCount, totalBytes := s.engine.index.Counts()
 	resp := map[string]any{
 		"node_id":     s.engine.index.NodeID(),
@@ -420,19 +553,28 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
+	setWriteDeadline(w, 2*time.Minute)
 	if r.Method == http.MethodPost && r.Body != nil {
 		defer r.Body.Close()
 		var reqPayload struct {
-			Folders  []config.FolderMapping `json:"folders"`
-			Dirs     []DirMeta              `json:"dirs,omitempty"`
-			PushDirs bool                   `json:"push_dirs,omitempty"`
+			Folders       []config.FolderMapping `json:"folders"`
+			Dirs          []DirMeta              `json:"dirs,omitempty"`
+			DirTombstones []Tombstone            `json:"dir_tombstones,omitempty"`
+			PushDirs      bool                   `json:"push_dirs,omitempty"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 2*1024*1024)).Decode(&reqPayload); err == nil {
+			cfg := s.engine.Config()
+			originNode := strings.TrimSpace(r.Header.Get("X-SyncT-Node"))
 			if len(reqPayload.Folders) > 0 {
 				s.engine.ApplyPeerFolderMappings(reqPayload.Folders)
 			}
-			if reqPayload.PushDirs && len(reqPayload.Dirs) > 0 {
-				s.engine.ApplyPeerDirs(reqPayload.Dirs, strings.TrimSpace(r.Header.Get("X-SyncT-Node")))
+			if reqPayload.PushDirs && cfg.SyncDirection != config.SyncPushOnly {
+				if len(reqPayload.Dirs) > 0 {
+					s.engine.ApplyPeerDirs(reqPayload.Dirs, originNode)
+				}
+				if len(reqPayload.DirTombstones) > 0 {
+					s.engine.ApplyPeerDirTombstones(reqPayload.DirTombstones, originNode)
+				}
 			}
 		}
 	}
@@ -448,8 +590,13 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 // a newly created empty folder appears on the other computer in real time
 // instead of waiting for the next periodic manifest exchange.
 func (s *Server) handleDirs(w http.ResponseWriter, r *http.Request) {
+	setWriteDeadline(w, 2*time.Minute)
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine.Config().SyncDirection == config.SyncPushOnly {
+		http.Error(w, "forbidden: server is push-only", http.StatusForbidden)
 		return
 	}
 	defer r.Body.Close()
@@ -492,17 +639,71 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		if cfg.SyncDirection == config.SyncPullOnly {
+			http.Error(w, "forbidden: server is pull-only", http.StatusForbidden)
+			return
+		}
 		s.serveFileDownload(w, r, relPath, fullPath)
 	case http.MethodPut, http.MethodPost:
+		if cfg.SyncDirection == config.SyncPushOnly {
+			http.Error(w, "forbidden: server is push-only", http.StatusForbidden)
+			return
+		}
 		s.serveFileUpload(w, r, cfg, relPath, fullPath)
 	case http.MethodDelete:
+		if cfg.SyncDirection == config.SyncPushOnly {
+			http.Error(w, "forbidden: server is push-only", http.StatusForbidden)
+			return
+		}
 		s.serveFileDelete(w, r, cfg, folder.LocalPath, relPath, fullPath)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Server) serveFileDownload(w http.ResponseWriter, _ *http.Request, relPath, fullPath string) {
+func parseByteRange(hdr string, size int64) (start, end int64, hasRange bool, valid bool) {
+	hdr = strings.TrimSpace(hdr)
+	if hdr == "" {
+		return 0, 0, false, false
+	}
+	if size <= 0 {
+		return 0, 0, true, false
+	}
+	if !strings.HasPrefix(hdr, "bytes=") {
+		return 0, 0, true, false
+	}
+	spec := strings.TrimSpace(strings.TrimPrefix(hdr, "bytes="))
+	if spec == "" || strings.Contains(spec, ",") {
+		return 0, 0, true, false
+	}
+	startStr, endStr, ok := strings.Cut(spec, "-")
+	if !ok {
+		return 0, 0, true, false
+	}
+	startStr = strings.TrimSpace(startStr)
+	endStr = strings.TrimSpace(endStr)
+	if startStr == "" {
+		return 0, 0, true, false
+	}
+	start, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return 0, 0, true, false
+	}
+	if endStr == "" {
+		end = size - 1
+	} else {
+		end, err = strconv.ParseInt(endStr, 10, 64)
+		if err != nil || end < start {
+			return 0, 0, true, false
+		}
+		if end >= size {
+			end = size - 1
+		}
+	}
+	return start, end, true, true
+}
+
+func (s *Server) serveFileDownload(w http.ResponseWriter, r *http.Request, relPath, fullPath string) {
 	f, err := os.Open(fullPath)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -519,6 +720,7 @@ func (s *Server) serveFileDownload(w http.ResponseWriter, _ *http.Request, relPa
 		return
 	}
 
+	fileSize := info.Size()
 	meta, hasMeta := s.engine.index.FileMeta(relPath)
 	if !hasMeta || meta.SHA256 == "" {
 		hash, hashErr := HashFile(fullPath)
@@ -529,20 +731,55 @@ func (s *Server) serveFileDownload(w http.ResponseWriter, _ *http.Request, relPa
 		meta = FileMeta{
 			FolderID: fid,
 			RelPath:  relPath,
-			Size:     info.Size(),
+			Size:     fileSize,
 			ModTime:  info.ModTime().UTC().UnixMilli(),
 			SHA256:   hash,
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("X-SyncT-ModTime", strconv.FormatInt(meta.ModTime, 10))
 	w.Header().Set("X-SyncT-SHA256", meta.SHA256)
+	w.Header().Set("X-SyncT-Size", strconv.FormatInt(fileSize, 10))
+
+	var src io.Reader = f
+	rangeStart, rangeEnd, hasRange, validRange := parseByteRange(r.Header.Get("Range"), fileSize)
+	if hasRange {
+		if !validRange || fileSize == 0 {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", fileSize))
+			http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if _, err := f.Seek(rangeStart, io.SeekStart); err != nil {
+			http.Error(w, "failed to seek file", http.StatusInternalServerError)
+			return
+		}
+		rangeLen := rangeEnd - rangeStart + 1
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, fileSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(rangeLen, 10))
+		setWriteDeadline(w, 2*time.Minute)
+		w.WriteHeader(http.StatusPartialContent)
+		src = io.LimitReader(f, rangeLen)
+	} else {
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		setWriteDeadline(w, 2*time.Minute)
+	}
 
 	start := time.Now()
+	lastDeadline := start
+	pw := &progressWriter{
+		w: w,
+		onMove: func(delta int64) {
+			s.engine.countUploadBytes(delta)
+			if now := time.Now(); now.Sub(lastDeadline) >= time.Second {
+				lastDeadline = now
+				setWriteDeadline(w, 2*time.Minute)
+			}
+		},
+	}
 	buf := ioBufferPool.Get().(*[]byte)
-	n, err := io.CopyBuffer(&progressWriter{w: w, onMove: s.engine.countUploadBytes}, f, *buf)
+	n, err := io.CopyBuffer(pw, src, *buf)
 	ioBufferPool.Put(buf)
 	if err != nil {
 		// Client went away mid-transfer or the disk stalled; nothing to retry here.
@@ -555,6 +792,7 @@ func (s *Server) serveFileDownload(w http.ResponseWriter, _ *http.Request, relPa
 }
 
 func (s *Server) serveFileUpload(w http.ResponseWriter, r *http.Request, cfg config.Config, relPath, fullPath string) {
+	setWriteDeadline(w, 2*time.Minute)
 	defer r.Body.Close()
 	start := time.Now()
 
@@ -612,7 +850,7 @@ func (s *Server) serveFileUpload(w http.ResponseWriter, r *http.Request, cfg con
 	if existingInfo, statErr := os.Stat(fullPath); statErr == nil && existingInfo.Mode().IsRegular() {
 		existingHash, hashErr := HashFile(fullPath)
 		if hashErr == nil && existingHash != "" && existingHash != actualHash {
-			if cfg.ConflictPolicy == config.ConflictKeepBoth && baseHash != "" && baseHash != existingHash {
+			if cfg.ConflictPolicy == config.ConflictKeepBoth && baseHash != existingHash {
 				backupPath := ConflictBackupPath(fullPath)
 				if err := copyFileContents(fullPath, backupPath); err == nil {
 					conflictSaved = true
@@ -678,6 +916,7 @@ func (s *Server) serveFileUpload(w http.ResponseWriter, r *http.Request, cfg con
 }
 
 func (s *Server) serveFileDelete(w http.ResponseWriter, r *http.Request, cfg config.Config, rootDir, relPath, fullPath string) {
+	setWriteDeadline(w, 2*time.Minute)
 	if !cfg.SyncDeletions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -744,6 +983,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Send initial handshake event
+	setWriteDeadline(w, 30*time.Second)
 	if _, err := fmt.Fprintf(w, "event: connected\ndata: {\"node_id\":%q}\n\n", s.engine.index.NodeID()); err != nil {
 		return
 	}
@@ -765,17 +1005,20 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
+			setWriteDeadline(w, 30*time.Second)
 			if _, err := fmt.Fprintf(w, "event: sync\ndata: %s\n\n", payload); err != nil {
 				return
 			}
 			flusher.Flush()
 		case <-sub.rescan:
 			payload, _ := json.Marshal(SyncEvent{Type: EventRescan, Timestamp: time.Now().UTC().UnixMilli()})
+			setWriteDeadline(w, 30*time.Second)
 			if _, err := fmt.Fprintf(w, "event: sync\ndata: %s\n\n", payload); err != nil {
 				return
 			}
 			flusher.Flush()
 		case <-ticker.C:
+			setWriteDeadline(w, 30*time.Second)
 			if _, err := fmt.Fprintf(w, ": heartbeat %d\n\n", time.Now().Unix()); err != nil {
 				return
 			}

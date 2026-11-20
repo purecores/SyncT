@@ -174,7 +174,7 @@ func TestUpsertRemoveFolder(t *testing.T) {
 }
 
 func TestShareCodeParsing(t *testing.T) {
-	url := "https://synctreei.suosmanthus.cyou"
+	url := "https://sync.example.com"
 	token := "st_roundtrip"
 	code := EncodeShareCode(url, token)
 	gotURL, gotToken, err := DecodeShareCode(code)
@@ -311,5 +311,42 @@ func TestSharePayloadJSONShape(t *testing.T) {
 	}
 	if string(payload) != `{"u":"u","t":"t"}` {
 		t.Fatalf("SharePayload json = %s", payload)
+	}
+}
+
+func TestDefaultSyncDirAndEmptyPublicDomain(t *testing.T) {
+	portableRoot := t.TempDir()
+	t.Setenv("SYNCT_DATA_DIR", portableRoot)
+	t.Setenv("SYNCT_DEFAULT_SYNC_DIR", "")
+	t.Setenv("SYNCT_PUBLIC_URL", "")
+
+	wantPortable := filepath.Join(portableRoot, "SyncFolder")
+	if got := DefaultSyncDir(); got != wantPortable {
+		t.Fatalf("DefaultSyncDir() with unset env = %q; want %q", got, wantPortable)
+	}
+	if info, err := os.Stat(wantPortable); err != nil || !info.IsDir() {
+		t.Fatalf("expected portable SyncFolder to exist: info=%v err=%v", info, err)
+	}
+
+	customDir := filepath.Join(t.TempDir(), "custom-sync")
+	t.Setenv("SYNCT_DEFAULT_SYNC_DIR", customDir)
+	if got := DefaultSyncDir(); got != customDir {
+		t.Fatalf("DefaultSyncDir() with SYNCT_DEFAULT_SYNC_DIR = %q; want %q", got, customDir)
+	}
+	if info, err := os.Stat(customDir); err != nil || !info.IsDir() {
+		t.Fatalf("expected custom sync dir to be created: info=%v err=%v", info, err)
+	}
+
+	if DefaultPublicDomain != "" {
+		t.Fatalf("DefaultPublicDomain = %q; want empty", DefaultPublicDomain)
+	}
+	if _, _, err := DecodeShareCode("not a code"); err == nil {
+		t.Fatal(`DecodeShareCode("not a code") must fail when DefaultPublicDomain is empty`)
+	}
+
+	t.Setenv("SYNCT_PUBLIC_URL", "sync.example.com/")
+	d := Default()
+	if d.CustomPublicURL != "https://sync.example.com" || d.RemoteURL != "https://sync.example.com" {
+		t.Fatalf("Default() with SYNCT_PUBLIC_URL = (%q, %q); want https://sync.example.com", d.CustomPublicURL, d.RemoteURL)
 	}
 }
